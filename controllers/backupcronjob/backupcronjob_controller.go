@@ -31,6 +31,7 @@ import (
 	"github.com/devfile/devworkspace-operator/pkg/constants"
 	"github.com/devfile/devworkspace-operator/pkg/infrastructure"
 	"github.com/devfile/devworkspace-operator/pkg/library/storage"
+	provstorage "github.com/devfile/devworkspace-operator/pkg/provision/storage"
 	"github.com/devfile/devworkspace-operator/pkg/secrets"
 	"github.com/go-logr/logr"
 	"github.com/robfig/cron/v3"
@@ -42,6 +43,7 @@ import (
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -94,6 +96,9 @@ func (r *BackupCronJobReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	return ctrl.NewControllerManagedBy(mgr).
 		Named("BackupCronJob").
+		WithOptions(controller.Options{
+			UsePriorityQueue: ptr.To(false),
+		}).
 		Watches(
 			&controllerv1alpha1.DevWorkspaceOperatorConfig{},
 			handler.EnqueueRequestsFromMapFunc(func(ctx context.Context, object client.Object) []reconcile.Request {
@@ -396,6 +401,7 @@ func (r *BackupCronJobReconciler) createBackupJob(
 				Spec: corev1.PodSpec{
 					ServiceAccountName: JobRunnerSAName + "-" + workspace.Status.DevWorkspaceId,
 					RestartPolicy:      corev1.RestartPolicyNever,
+					SecurityContext:    dwOperatorConfig.Config.Workspace.PodSecurityContext,
 					Containers: []corev1.Container{
 						{
 							Name: "backup-workspace",
@@ -411,7 +417,7 @@ func (r *BackupCronJobReconciler) createBackupJob(
 								{Name: "ORAS_EXTRA_ARGS", Value: orasExtraArgs},
 							},
 							Image:           images.GetProjectBackupImage(),
-							ImagePullPolicy: "Always",
+							ImagePullPolicy: getImagePullPolicy(dwOperatorConfig),
 							Args: []string{
 								"/workspace-recovery.sh",
 								"--backup",
@@ -451,6 +457,18 @@ func (r *BackupCronJobReconciler) createBackupJob(
 			},
 		},
 	}
+	// Pin backup Job to the node where the PVC is currently mounted to avoid
+	// Multi-Attach errors with ReadWriteOnce PVCs on multi-node clusters.
+	targetNode, err := provstorage.FindNodeForPVC(ctx, r.Client, workspace.Namespace, pvc.Name)
+	if err != nil {
+		log.Error(err, "Failed to find node with PVC, backup Job will not have node affinity", "pvc", pvc.Name)
+	} else if targetNode == "" {
+		log.Info("No target node for backup job, NodeAffinity will not be defined", "pvc", pvc.Name)
+	}
+	if targetNode != "" {
+		job.Spec.Template.Spec.Affinity = provstorage.NodeAffinityForHostname(targetNode)
+	}
+
 	if registryAuthSecret != nil {
 		job.Spec.Template.Spec.Volumes = append(job.Spec.Template.Spec.Volumes, corev1.Volume{
 			Name: constants.RegistryAuthVolumeName,
@@ -481,4 +499,11 @@ func (r *BackupCronJobReconciler) createBackupJob(
 	}
 	log.Info("Created backup Job for DevWorkspace", "jobName", job.Name, "devworkspace", workspace.Name)
 	return nil
+}
+
+func getImagePullPolicy(dwOperatorConfig *controllerv1alpha1.DevWorkspaceOperatorConfig) corev1.PullPolicy {
+	if dwOperatorConfig.Config.Workspace.ImagePullPolicy != "" {
+		return corev1.PullPolicy(dwOperatorConfig.Config.Workspace.ImagePullPolicy)
+	}
+	return corev1.PullAlways
 }

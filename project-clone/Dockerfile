@@ -15,7 +15,8 @@
 
 # Build the manager binary
 # https://access.redhat.com/containers/?tab=tags#/registry.access.redhat.com/ubi9/go-toolset
-FROM registry.access.redhat.com/ubi9/go-toolset:1.24.6-1758501173 as builder
+# Image pinned by SHA256 to address GitHub security bot warnings about unpinned dependencies
+FROM registry.access.redhat.com/ubi9/go-toolset:1.26.5-1783931515@sha256:d8698410eb806fedd5c0ddbd08e981436051e0ed2113b8e402736e7ee578f6f4 as builder
 ARG TARGETARCH
 ARG TARGETOS
 ENV GOPATH=/go/

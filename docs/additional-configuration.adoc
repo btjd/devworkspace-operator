@@ -141,6 +141,16 @@ By default, resources will be mounted based on the resource name:
 Mounting resources can be additionally configured via **annotations**:
 
 * `controller.devfile.io/mount-path`: configure where the resource should be mounted
++
+For persistent volume claims, `controller.devfile.io/mount-path` also supports a JSON array to mount multiple subdirectories at different paths:
++
+[source,yaml]
+----
+annotations:
+  controller.devfile.io/mount-path: '[{"path":"/var/logs","subPath":"data/logs"},{"path":"/etc/config","subPath":"data/config"}]'
+----
++
+Each entry requires a `path` field (the container mount path) and an optional `subPath` field (the subdirectory within the PVC). An empty or missing annotation falls back to `/tmp/<pvc-name>`.
 * `controller.devfile.io/mount-access-mode`: for secrets and configmaps only, configure file permissions on files mounted from this configmap/secret. Permissions can be specified in decimal (e.g. `"511"`) or octal notation by prefixing with a "0" (e.g. `"0777"`)
 * `controller.devfile.io/mount-as`: for secrets and configmaps only, configure how the resource should be mounted to the workspace
 +
@@ -155,6 +165,68 @@ Mounting resources can be additionally configured via **annotations**:
 When "file" is used, the configmap is mounted as a directory within the workspace, erasing any files/directories already present. When "subpath" is used, each key in the configmap/secret is mounted as a subpath volume mount in the mount path, leaving existing files intact but preventing changes to the secret/configmap from propagating into the workspace without a restart.
 
 * `controller.devfile.io/read-only`: for persistent volume claims, mount the resource as read-only
+
+* `controller.devfile.io/mount-on-start`: when set to `"true"`, the resource will only be mounted when a workspace starts. If the resource is created while a workspace is already running, it will not be automatically mounted until the workspace is restarted. This prevents unwanted workspace restarts caused by newly created automount resources. This annotation can be applied to configmaps, secrets, and persistent volume claims.
++
+For git credential secrets (labeled with `controller.devfile.io/git-credential`)
+and git TLS configmaps (labelled with `controller.devfile.io/git-tls-credential`),
+this annotation behaves differently. The `controller.devfile.io/mount-on-start` annotation is evaluated across
+all git credential resources as a group, not individually. Since all git credentials are
+merged into a single mounted secret, if at least one git credential secret (or TLS configmap)
+lacks the `controller.devfile.io/mount-on-start` annotation, all git credentials
+(or TLS configmaps) will be mounted, including those marked with `controller.devfile.io/mount-on-start`.
+
+* `controller.devfile.io/mount-to-devworkspace-include`: configure which DevWorkspaces the
+resource should be mounted to. The value is a comma-separated list of patterns matched against
+the DevWorkspace name. The resource is only mounted to workspaces whose name matches at
+least one pattern. This annotation can be applied to ConfigMaps, Secrets and Persistent Volume Claims.
++
+* `controller.devfile.io/mount-to-devworkspace-exclude`: configure which DevWorkspaces the
+resource should NOT be mounted to. The value is a comma-separated list of patterns
+matched against the DevWorkspace name. The resource is not mounted to workspaces whose name
+matches any pattern. This annotation can be applied to ConfigMaps, Secrets and Persistent Volume Claims.
++
+Supported patterns for both annotations:
++
+--
+** `name` -- exact match
+** `name*` -- prefix match
+** `*name` -- suffix match
+** `\*name*` -- contains match
+** `*` -- matches all workspaces
+--
++
+Both annotations can be used at the same time on the same resource. When both are present, the resource is mounted only to workspaces that match the include pattern AND do not match the exclude pattern.
+If neither annotation is present, the resource is mounted to all workspaces (default behavior).
++
+[source,yaml]
+----
+metadata:
+  annotations:
+    controller.devfile.io/mount-to-devworkspace-include: "my-workspace, staging-*"
+----
++
+[source,yaml]
+----
+metadata:
+  annotations:
+    controller.devfile.io/mount-to-devworkspace-exclude: "temp-*, *-test"
+----
++
+[source,yaml]
+----
+metadata:
+  annotations:
+    controller.devfile.io/mount-to-devworkspace-include: "staging-*"
+    controller.devfile.io/mount-to-devworkspace-exclude: "staging-legacy"
+----
++
+[source,yaml]
+----
+metadata:
+  annotations:
+    controller.devfile.io/mount-on-start: "true"
+----
 
 ## Adding image pull secrets to workspaces
 Labelling secrets with `controller.devfile.io/devworkspace_pullsecret: true` marks a secret as the Docker pull secret for the workspace deployment. This should be applied to secrets with docker config types (`kubernetes.io/dockercfg` and `kubernetes.io/dockerconfigjson`)
@@ -179,6 +251,19 @@ data:
 *Note:* As for automatically mounting secrets, it is necessary to apply the `controller.devfile.io/watch-secret` label to git credentials secrets
 
 This will mount a file `/tmp/.git-credentials/credentials` in all workspace containers, and construct a git config to use this file as a credentials store.
+
+### Using a base gitconfig
+If an automount configmap or secret (labeled with `controller.devfile.io/automount: true`)
+is mounted as `subpath` and contains a key that resolves to `/etc/gitconfig`,
+its contents are used as the base git configuration for the workspace.
+This base gitconfig is merged with the generated git credentials configuration.
+
+For example, a configmap with `controller.devfile.io/mount-path: /etc` and a key named
+`gitconfig` will be detected and used as the base git configuration.
+
+The `controller.devfile.io/mount-to-devworkspace-include` and
+`controller.devfile.io/mount-to-devworkspace-exclude` annotations are respected,
+allowing the base gitconfig to be targeted to specific workspaces.
 
 ## Configuring DevWorkspaces to use SSH keys for Git operations
 Git SSH keys can be configured for DevWorkspaces by mounting secrets to workspaces.
@@ -275,6 +360,56 @@ spec:
 merged with the default DevWorkspaceOperatorConfig, overriding
 fields in the default configuration. Fields unset in the overridden
 configuration will use the global values.
+
+## Configuring cross-namespace DevWorkspaceTemplate imports
+
+By default, a DevWorkspace can only import a DevWorkspaceTemplate from its own namespace.
+To allow a DevWorkspaceTemplate to be imported by DevWorkspaces in other namespaces,
+the annotation `controller.devfile.io/allow-import-from` must be added to the DevWorkspaceTemplate.
+
+The annotation supports the following values:
+
+* `*`: allow importing by all DevWorkspaces on the cluster
+* `namespaceA,namespaceB`: allow importing by DevWorkspaces in a specific list of namespaces
+
+If the annotation is not set or is empty, only DevWorkspaces in the same namespace as the template can reference it.
+
+[source,yaml]
+----
+apiVersion: workspace.devfile.io/v1alpha2
+kind: DevWorkspaceTemplate
+metadata:
+  name: my-template
+  namespace: platform-namespace
+  annotations:
+    controller.devfile.io/allow-import-from: "*"  # allow all namespaces
+----
+
+Or to restrict to specific namespaces:
+
+[source,yaml]
+----
+apiVersion: workspace.devfile.io/v1alpha2
+kind: DevWorkspaceTemplate
+metadata:
+  name: my-template
+  namespace: platform-namespace
+  annotations:
+    controller.devfile.io/allow-import-from: "namespace-a,namespace-b"
+----
+
+A DevWorkspace can then reference the template using the `parent.kubernetes` field in the devfile:
+
+[source,yaml]
+----
+schemaVersion: 2.2.0
+metadata:
+  name: my-workspace
+parent:
+  kubernetes:
+    name: my-template
+    namespace: platform-namespace
+----
 
 ## Fine-grained configuration of workspace pods and containers
 The attributes `pod-overrides` and `container-overrides` can be applied to DevWorkspaces in order to configure fields on the Kubernetes objects that are not normally exposed through the Kubernetes API.

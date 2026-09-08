@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -108,15 +108,34 @@ type BackupCronJobConfig struct {
 	OrasConfig *OrasConfig `json:"oras,omitempty"`
 	// Schedule specifies the cron schedule for the backup cron job.
 	// For example, "0 1 * * *" runs daily at 1 AM.
-	// +kubebuilder:default:="0 1 * * *"
+	// +kubebuilder:default:="0 0 1 * *"
 	// +kubebuilder:validation:Optional
 	Schedule string `json:"schedule,omitempty"`
 	// BackoffLimit specifies the number of retries before marking a backup job as failed.
-	// Defaults to 3 if not specified.
+	// Defaults to 1 if not specified.
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default:=3
+	// +kubebuilder:default:=1
 	// +kubebuilder:validation:Optional
 	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
+}
+
+// GatewayReference defines a reference to a Gateway API Gateway resource
+// that HTTPRoutes should attach to via parentRefs.
+type GatewayReference struct {
+	// Name is the name of the Gateway resource
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+	// Namespace is the namespace of the Gateway resource.
+	// If not specified, HTTPRoutes will reference a Gateway in the same namespace
+	// as the DevWorkspace.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace *string `json:"namespace,omitempty"`
 }
 
 type RoutingConfig struct {
@@ -144,6 +163,30 @@ type RoutingConfig struct {
 	// TLSCertificateConfigmapRef defines the name and namespace of the configmap with a certificate to inject into the
 	// HTTP client.
 	TLSCertificateConfigmapRef *ConfigmapReference `json:"tlsCertificateConfigmapRef,omitempty"`
+	// GatewayRef defines a reference to a Gateway API Gateway resource that HTTPRoutes
+	// should attach to when using the 'gateway-api' routing class. This field is required
+	// when routingClass is set to 'gateway-api'. The referenced Gateway must be provisioned
+	// by the cluster administrator before workspaces can use Gateway API routing.
+	// +kubebuilder:validation:Optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
+}
+
+// OverrideConfig defines configuration options for controlling which fields are restricted
+// in `container-overrides` and `pod-overrides` DevWorkspace attributes.
+// Entries support value-level restrictions: "fieldName" restricts the field entirely,
+// while "fieldName=value" restricts only that specific value (other values remain allowed).
+type OverrideConfig struct {
+	// RestrictedContainerOverrideFields defines a list of container-level fields that are restricted
+	// in `container-overrides` attributes. Note that the following fields are always implicitly
+	// restricted and cannot be permitted: `name`, `image`, `command`, `args`, `ports`, `env`.
+	// +kubebuilder:validation:Optional
+	RestrictedContainerOverrideFields []string `json:"restrictedContainerOverrideFields,omitempty"`
+
+	// RestrictedPodOverrideFields defines a list of pod-level fields that are restricted
+	// in `pod-overrides` attributes. Note that the following fields are always implicitly
+	// restricted and cannot be permitted: `containers`, `initContainers`.
+	// +kubebuilder:validation:Optional
+	RestrictedPodOverrideFields []string `json:"restrictedPodOverrideFields,omitempty"`
 }
 
 type WorkspaceConfig struct {
@@ -230,7 +273,7 @@ type WorkspaceConfig struct {
 	SchedulerName string `json:"schedulerName,omitempty"`
 	// DefaultContainerResources defines the resource requirements (memory/cpu limit/request) used for
 	// container components that do not define limits or requests. In order to not set a field by default,
-	// the value "0" should be used. By default, the memory limit is 128Mi and the memory request is 64Mi.
+	// the value "0" should be used. By default, the memory limit is 256Mi and the memory request is 128Mi.
 	// No CPU limit or request is added by default.
 	DefaultContainerResources *corev1.ResourceRequirements `json:"defaultContainerResources,omitempty"`
 	// ContainerResourceCaps defines the maximum resource requirements enforced for workspace
@@ -264,6 +307,9 @@ type WorkspaceConfig struct {
 	// InitContainers defines a list of Kubernetes init containers that are automatically injected into all workspace pods.
 	// Typical uses cases include injecting organization tools/configs, initializing persistent home, etc.
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
+	// Overrides defines configuration options for `container-overrides` and
+	// `pod-overrides` DevWorkspace attributes.
+	Overrides *OverrideConfig `json:"overrides,omitempty"`
 }
 
 type WebhookConfig struct {

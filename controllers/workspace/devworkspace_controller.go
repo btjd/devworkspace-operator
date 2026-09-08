@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -23,6 +23,7 @@ import (
 	"time"
 
 	"github.com/devfile/devworkspace-operator/pkg/library/initcontainers"
+	"github.com/devfile/devworkspace-operator/pkg/library/overrides"
 	"github.com/devfile/devworkspace-operator/pkg/library/ssh"
 
 	dw "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
@@ -144,9 +145,6 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	reqLogger = reqLogger.WithValues(constants.DevWorkspaceIDLoggerKey, workspace.Status.DevWorkspaceId)
 	reqLogger.Info("Reconciling Workspace", "resolvedConfig", configString)
 
-	// Inject ca certificates to the http client, if the certificates configmap is created and defined in the config.
-	InjectCertificates(r.Client, r.Log)
-
 	// Check if the DevWorkspaceRouting instance is marked to be deleted, which is
 	// indicated by the deletion timestamp being set.
 	if workspace.GetDeletionTimestamp() != nil {
@@ -260,6 +258,8 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return reconcile.Result{Requeue: true}, err
 	}
 
+	httpClient := httpClientsFactory.GetHttpClient(ctx, config.Routing)
+
 	flattenHelpers := flatten.ResolverTools{
 		WorkspaceNamespace:          workspace.Namespace,
 		Context:                     ctx,
@@ -339,6 +339,7 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		workspace.Config.Workspace.DefaultContainerResources,
 		workspace.Config.Workspace.ContainerResourceCaps,
 		workspace.Config.Workspace.PostStartTimeout,
+		overrides.GetRestrictedContainerOverrideFields(workspace),
 		postStartDebugTrapSleepDuration,
 	)
 	if err != nil {
@@ -454,8 +455,18 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.failWorkspace(workspace, fmt.Sprintf("Failed to mount SSH askpass script to workspace: %s", err), metrics.ReasonWorkspaceEngineFailure, reqLogger, &reconcileStatus), nil
 	}
 
-	// Add automount resources into devfile containers
-	err = automount.ProvisionAutoMountResourcesInto(devfilePodAdditions, clusterAPI, workspace.Namespace, home.PersistUserHomeEnabled(workspace))
+	var workspaceDeployment *appsv1.Deployment
+
+	if workspace.Status.Phase == dw.DevWorkspaceStatusRunning {
+		// Fetch the existing deployment to determine whether automount resources with
+		// `controller.devfile.io/mount-on-start=true` can be mounted without a restart.
+		// Only needed when the workspace is already running; skip otherwise to reduce API calls.
+		if workspaceDeployment, err = wsprovision.GetClusterDeployment(workspace, clusterAPI); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	err = automount.ProvisionAutoMountResourcesInto(devfilePodAdditions, clusterAPI, workspace.Namespace, workspace.Name, home.PersistUserHomeEnabled(workspace), workspaceDeployment)
 	if shouldReturn, reconcileResult, reconcileErr := r.checkDWError(workspace, err, "Failed to process automount resources", metrics.ReasonBadRequest, reqLogger, &reconcileStatus); shouldReturn {
 		return reconcileResult, reconcileErr
 	}
@@ -778,7 +789,10 @@ func (r *DevWorkspaceReconciler) getWorkspaceId(ctx context.Context, workspace *
 }
 
 func (r *DevWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	setupHttpClients(mgr.GetClient(), mgr.GetLogger())
+	err := SetupHttpClientsFactory(mgr.GetClient(), mgr.GetLogger())
+	if err != nil {
+		return err
+	}
 
 	maxConcurrentReconciles, err := wkspConfig.GetMaxConcurrentReconciles()
 	if err != nil {
@@ -794,7 +808,10 @@ func (r *DevWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// TODO: Set up indexing https://book.kubebuilder.io/cronjob-tutorial/controller-implementation.html#setup
 	return ctrl.NewControllerManagedBy(mgr).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: maxConcurrentReconciles,
+			UsePriorityQueue:        pointer.Bool(false),
+		}).
 		For(&dw.DevWorkspace{}).
 		// List DevWorkspaceTemplates as owned to enable updating workspaces when templates
 		// are changed; this should be moved to whichever controller is responsible for flattening

@@ -56,6 +56,31 @@ spec:
                       specifies an empty `.spec.routingClass`. Supported routingClasses can be defined
                       in other controllers. If not specified, the default value of "basic" is used.
                     type: string
+                  gatewayRef:
+                    description: |-
+                      GatewayRef defines a reference to a Gateway API Gateway resource that HTTPRoutes
+                      should attach to when using the 'gateway-api' routing class. This field is required
+                      when routingClass is set to 'gateway-api'. The referenced Gateway must be provisioned
+                      by the cluster administrator before workspaces can use Gateway API routing.
+                    properties:
+                      name:
+                        description: Name is the name of the Gateway resource
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace is the namespace of the Gateway resource.
+                          If not specified, HTTPRoutes will reference a Gateway in the same namespace
+                          as the DevWorkspace.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                    required:
+                    - name
+                    type: object
                   proxyConfig:
                     description: |-
                       ProxyConfig defines the proxy settings that should be used for all DevWorkspaces.
@@ -155,9 +180,10 @@ spec:
                         operator:
                           description: |-
                             Operator represents a key's relationship to the value.
-                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                             Exists is equivalent to wildcard for value, so that a pod can
                             tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                           type: string
                         tolerationSeconds:
                           description: |-
@@ -185,10 +211,10 @@ spec:
                       for a cron job that automatically backs up workspace PVCs.
                     properties:
                       backoffLimit:
-                        default: 3
+                        default: 1
                         description: |-
                           BackoffLimit specifies the number of retries before marking a backup job as failed.
-                          Defaults to 3 if not specified.
+                          Defaults to 1 if not specified.
                         format: int32
                         minimum: 0
                         type: integer
@@ -231,7 +257,7 @@ spec:
                         - path
                         type: object
                       schedule:
-                        default: 0 1 * * *
+                        default: 0 0 1 * *
                         description: |-
                           Schedule specifies the cron schedule for the backup cron job.
                           For example, "0 1 * * *" runs daily at 1 AM.
@@ -416,7 +442,6 @@ spec:
                           procMount denotes the type of proc mount to use for the containers.
                           The default value is Default which uses the container runtime defaults for
                           readonly paths and masked paths.
-                          This requires the ProcMountType feature flag to be enabled.
                           Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       readOnlyRootFilesystem:
@@ -540,7 +565,7 @@ spec:
                     description: |-
                       DefaultContainerResources defines the resource requirements (memory/cpu limit/request) used for
                       container components that do not define limits or requests. In order to not set a field by default,
-                      the value "0" should be used. By default, the memory limit is 128Mi and the memory request is 64Mi.
+                      the value "0" should be used. By default, the memory limit is 256Mi and the memory request is 128Mi.
                       No CPU limit or request is added by default.
                     properties:
                       claims:
@@ -3553,7 +3578,9 @@ spec:
                               type: integer
                           type: object
                         resizePolicy:
-                          description: Resources resize policy for the container.
+                          description: |-
+                            Resources resize policy for the container.
+                            This field cannot be set on ephemeral containers.
                           items:
                             description: ContainerResizePolicy represents resource
                               resize policy for the container.
@@ -3783,7 +3810,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -4208,6 +4234,28 @@ spec:
                       - name
                       type: object
                     type: array
+                  overrides:
+                    description: |-
+                      Overrides defines configuration options for `container-overrides` and
+                      `pod-overrides` DevWorkspace attributes.
+                    properties:
+                      restrictedContainerOverrideFields:
+                        description: |-
+                          RestrictedContainerOverrideFields defines a list of container-level fields that are restricted
+                          in `container-overrides` attributes. Note that the following fields are always implicitly
+                          restricted and cannot be permitted: `name`, `image`, `command`, `args`, `ports`, `env`.
+                        items:
+                          type: string
+                        type: array
+                      restrictedPodOverrideFields:
+                        description: |-
+                          RestrictedPodOverrideFields defines a list of pod-level fields that are restricted
+                          in `pod-overrides` attributes. Note that the following fields are always implicitly
+                          restricted and cannot be permitted: `containers`, `initContainers`.
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   persistUserHome:
                     description: |-
                       PersistUserHome defines configuration options for persisting the `/home/user/`

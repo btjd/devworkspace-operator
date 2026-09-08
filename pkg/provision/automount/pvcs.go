@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,19 +16,65 @@
 package automount
 
 import (
+	"encoding/json"
+	"fmt"
 	"path"
+	"strings"
 
-	"github.com/devfile/devworkspace-operator/pkg/provision/sync"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	ctrl "sigs.k8s.io/controller-runtime"
 	k8sclient "sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/devfile/devworkspace-operator/pkg/common"
 	"github.com/devfile/devworkspace-operator/pkg/constants"
+	"github.com/devfile/devworkspace-operator/pkg/provision/sync"
 )
 
-func getAutoMountPVCs(namespace string, api sync.ClusterAPI) (*Resources, error) {
+var (
+	log = ctrl.Log.WithName("automount")
+)
+
+type mountPathEntry struct {
+	Path    string `json:"path"`
+	SubPath string `json:"subPath,omitempty"`
+}
+
+func parseMountPathAnnotation(annotation string, pvcName string) ([]mountPathEntry, error) {
+	if annotation == "" {
+		return []mountPathEntry{{Path: path.Join("/tmp/", pvcName)}}, nil
+	}
+
+	if !strings.HasPrefix(annotation, "[") {
+		return []mountPathEntry{{Path: annotation}}, nil
+	}
+
+	var entries []mountPathEntry
+	if err := json.Unmarshal([]byte(annotation), &entries); err != nil {
+		return nil, fmt.Errorf("failed to parse mount-path annotation on PVC %s: %w", pvcName, err)
+	}
+
+	if len(entries) == 0 {
+		return []mountPathEntry{{Path: path.Join("/tmp/", pvcName)}}, nil
+	}
+
+	for i, entry := range entries {
+		if entry.Path == "" {
+			return nil, fmt.Errorf("mount-path annotation on PVC %s: entry %d is missing required field 'path'", pvcName, i)
+		}
+	}
+
+	return entries, nil
+}
+
+func getAutoMountPVCs(
+	workspaceNamespace string,
+	workspaceName string,
+	api sync.ClusterAPI,
+	workspaceDeployment *appsv1.Deployment,
+) (*Resources, error) {
 	pvcs := &corev1.PersistentVolumeClaimList{}
-	if err := api.Client.List(api.Ctx, pvcs, k8sclient.InNamespace(namespace), k8sclient.MatchingLabels{
+	if err := api.Client.List(api.Ctx, pvcs, k8sclient.InNamespace(workspaceNamespace), k8sclient.MatchingLabels{
 		constants.DevWorkspaceMountLabel: "true",
 	}); err != nil {
 		return nil, err
@@ -37,20 +83,17 @@ func getAutoMountPVCs(namespace string, api sync.ClusterAPI) (*Resources, error)
 		return nil, nil
 	}
 
-	var volumes []corev1.Volume
-	var volumeMounts []corev1.VolumeMount
+	var allAutoMountResources []Resources
 	for _, pvc := range pvcs.Items {
-		mountPath := pvc.Annotations[constants.DevWorkspaceMountPathAnnotation]
-		if mountPath == "" {
-			mountPath = path.Join("/tmp/", pvc.Name)
+		// Filter resources by workspace name
+		if !MatchesWorkspaceTarget(&pvc, workspaceName) {
+			log.V(1).Info("Skipping PVC mount, workspace does not match include/exclude annotations", "namespace", pvc.Namespace, "name", pvc.Name, "workspace", workspaceName)
+			continue
 		}
 
-		mountReadOnly := false
-		if pvc.Annotations[constants.DevWorkspaceMountReadyOnlyAnnotation] == "true" {
-			mountReadOnly = true
-		}
+		mountReadOnly := pvc.Annotations[constants.DevWorkspaceMountReadyOnlyAnnotation] == "true"
 
-		volumes = append(volumes, corev1.Volume{
+		volume := corev1.Volume{
 			Name: common.AutoMountPVCVolumeName(pvc.Name),
 			VolumeSource: corev1.VolumeSource{
 				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
@@ -58,14 +101,35 @@ func getAutoMountPVCs(namespace string, api sync.ClusterAPI) (*Resources, error)
 					ReadOnly:  mountReadOnly,
 				},
 			},
-		})
-		volumeMounts = append(volumeMounts, corev1.VolumeMount{
-			Name:      common.AutoMountPVCVolumeName(pvc.Name),
-			MountPath: mountPath,
-		})
+		}
+
+		mountPathEntries, err := parseMountPathAnnotation(pvc.Annotations[constants.DevWorkspaceMountPathAnnotation], pvc.Name)
+		if err != nil {
+			return nil, err
+		}
+
+		var volumeMounts []corev1.VolumeMount
+		for _, entry := range mountPathEntries {
+			volumeMounts = append(volumeMounts, corev1.VolumeMount{
+				Name:      common.AutoMountPVCVolumeName(pvc.Name),
+				MountPath: entry.Path,
+				SubPath:   entry.SubPath,
+			})
+		}
+
+		automountPVC := Resources{
+			Volumes:      []corev1.Volume{volume},
+			VolumeMounts: volumeMounts,
+		}
+
+		if !canMountWithoutRestart(&pvc, automountPVC, workspaceDeployment) {
+			log.V(1).Info("Skipping PVC mount: resource requires workspace restart to be mounted", "namespace", pvc.Namespace, "name", pvc.Name, "workspace", workspaceName)
+			continue
+		}
+
+		allAutoMountResources = append(allAutoMountResources, automountPVC)
 	}
-	return &Resources{
-		Volumes:      volumes,
-		VolumeMounts: volumeMounts,
-	}, nil
+
+	automountResources := flattenAutomountResources(allAutoMountResources)
+	return &automountResources, nil
 }

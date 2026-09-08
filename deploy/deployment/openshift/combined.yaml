@@ -58,6 +58,31 @@ spec:
                       specifies an empty `.spec.routingClass`. Supported routingClasses can be defined
                       in other controllers. If not specified, the default value of "basic" is used.
                     type: string
+                  gatewayRef:
+                    description: |-
+                      GatewayRef defines a reference to a Gateway API Gateway resource that HTTPRoutes
+                      should attach to when using the 'gateway-api' routing class. This field is required
+                      when routingClass is set to 'gateway-api'. The referenced Gateway must be provisioned
+                      by the cluster administrator before workspaces can use Gateway API routing.
+                    properties:
+                      name:
+                        description: Name is the name of the Gateway resource
+                        maxLength: 253
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$
+                        type: string
+                      namespace:
+                        description: |-
+                          Namespace is the namespace of the Gateway resource.
+                          If not specified, HTTPRoutes will reference a Gateway in the same namespace
+                          as the DevWorkspace.
+                        maxLength: 63
+                        minLength: 1
+                        pattern: ^[a-z0-9]([-a-z0-9]*[a-z0-9])?$
+                        type: string
+                    required:
+                    - name
+                    type: object
                   proxyConfig:
                     description: |-
                       ProxyConfig defines the proxy settings that should be used for all DevWorkspaces.
@@ -157,9 +182,10 @@ spec:
                         operator:
                           description: |-
                             Operator represents a key's relationship to the value.
-                            Valid operators are Exists and Equal. Defaults to Equal.
+                            Valid operators are Exists, Equal, Lt, and Gt. Defaults to Equal.
                             Exists is equivalent to wildcard for value, so that a pod can
                             tolerate all taints of a particular category.
+                            Lt and Gt perform numeric comparisons (requires feature gate TaintTolerationComparisonOperators).
                           type: string
                         tolerationSeconds:
                           description: |-
@@ -187,10 +213,10 @@ spec:
                       for a cron job that automatically backs up workspace PVCs.
                     properties:
                       backoffLimit:
-                        default: 3
+                        default: 1
                         description: |-
                           BackoffLimit specifies the number of retries before marking a backup job as failed.
-                          Defaults to 3 if not specified.
+                          Defaults to 1 if not specified.
                         format: int32
                         minimum: 0
                         type: integer
@@ -233,7 +259,7 @@ spec:
                         - path
                         type: object
                       schedule:
-                        default: 0 1 * * *
+                        default: 0 0 1 * *
                         description: |-
                           Schedule specifies the cron schedule for the backup cron job.
                           For example, "0 1 * * *" runs daily at 1 AM.
@@ -418,7 +444,6 @@ spec:
                           procMount denotes the type of proc mount to use for the containers.
                           The default value is Default which uses the container runtime defaults for
                           readonly paths and masked paths.
-                          This requires the ProcMountType feature flag to be enabled.
                           Note that this field cannot be set when spec.os.name is windows.
                         type: string
                       readOnlyRootFilesystem:
@@ -542,7 +567,7 @@ spec:
                     description: |-
                       DefaultContainerResources defines the resource requirements (memory/cpu limit/request) used for
                       container components that do not define limits or requests. In order to not set a field by default,
-                      the value "0" should be used. By default, the memory limit is 128Mi and the memory request is 64Mi.
+                      the value "0" should be used. By default, the memory limit is 256Mi and the memory request is 128Mi.
                       No CPU limit or request is added by default.
                     properties:
                       claims:
@@ -3555,7 +3580,9 @@ spec:
                               type: integer
                           type: object
                         resizePolicy:
-                          description: Resources resize policy for the container.
+                          description: |-
+                            Resources resize policy for the container.
+                            This field cannot be set on ephemeral containers.
                           items:
                             description: ContainerResizePolicy represents resource
                               resize policy for the container.
@@ -3785,7 +3812,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -4210,6 +4236,28 @@ spec:
                       - name
                       type: object
                     type: array
+                  overrides:
+                    description: |-
+                      Overrides defines configuration options for `container-overrides` and
+                      `pod-overrides` DevWorkspace attributes.
+                    properties:
+                      restrictedContainerOverrideFields:
+                        description: |-
+                          RestrictedContainerOverrideFields defines a list of container-level fields that are restricted
+                          in `container-overrides` attributes. Note that the following fields are always implicitly
+                          restricted and cannot be permitted: `name`, `image`, `command`, `args`, `ports`, `env`.
+                        items:
+                          type: string
+                        type: array
+                      restrictedPodOverrideFields:
+                        description: |-
+                          RestrictedPodOverrideFields defines a list of pod-level fields that are restricted
+                          in `pod-overrides` attributes. Note that the following fields are always implicitly
+                          restricted and cannot be permitted: `containers`, `initContainers`.
+                        items:
+                          type: string
+                        type: array
+                    type: object
                   persistUserHome:
                     description: |-
                       PersistUserHome defines configuration options for persisting the `/home/user/`
@@ -6227,7 +6275,9 @@ spec:
                               type: integer
                           type: object
                         resizePolicy:
-                          description: Resources resize policy for the container.
+                          description: |-
+                            Resources resize policy for the container.
+                            This field cannot be set on ephemeral containers.
                           items:
                             description: ContainerResizePolicy represents resource
                               resize policy for the container.
@@ -6457,7 +6507,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -7758,7 +7807,9 @@ spec:
                               type: integer
                           type: object
                         resizePolicy:
-                          description: Resources resize policy for the container.
+                          description: |-
+                            Resources resize policy for the container.
+                            This field cannot be set on ephemeral containers.
                           items:
                             description: ContainerResizePolicy represents resource
                               resize policy for the container.
@@ -7988,7 +8039,6 @@ spec:
                                 procMount denotes the type of proc mount to use for the containers.
                                 The default value is Default which uses the container runtime defaults for
                                 readonly paths and masked paths.
-                                This requires the ProcMountType feature flag to be enabled.
                                 Note that this field cannot be set when spec.os.name is windows.
                               type: string
                             readOnlyRootFilesystem:
@@ -9097,7 +9147,7 @@ spec:
                                     resources:
                                       description: |-
                                         resources represents the minimum resources the volume should have.
-                                        If RecoverVolumeExpansionFailure feature is enabled users are allowed to specify resource requirements
+                                        Users are allowed to specify resource requirements
                                         that are lower than previous value but must still be higher than capacity recorded in the
                                         status field of the claim.
                                         More info: https://kubernetes.io/docs/concepts/storage/persistent-volumes#resources
@@ -9429,7 +9479,7 @@ spec:
                             A failure to resolve or pull the image during pod startup will block containers from starting and may add significant latency. Failures will be retried using normal volume backoff and will be reported on the pod reason and message.
                             The types of objects that may be mounted by this volume are defined by the container runtime implementation on a host machine and at minimum must include all valid types supported by the container image field.
                             The OCI object gets mounted in a single directory (spec.containers[*].volumeMounts.mountPath) by merging the manifest layers in the same way as for container images.
-                            The volume will be mounted read-only (ro) and non-executable files (noexec).
+                            The volume will be mounted read-only (ro).
                             Sub path mounts for containers are not supported (spec.containers[*].volumeMounts.subpath) before 1.33.
                             The field spec.securityContext.fsGroupChangePolicy has no effect on this volume type.
                           properties:
@@ -9601,8 +9651,7 @@ spec:
                           description: |-
                             portworxVolume represents a portworx volume attached and mounted on kubelets host machine.
                             Deprecated: PortworxVolume is deprecated. All operations for the in-tree portworxVolume type
-                            are redirected to the pxd.portworx.com CSI driver when the CSIMigrationPortworx feature-gate
-                            is on.
+                            are redirected to the pxd.portworx.com CSI driver.
                           properties:
                             fsType:
                               description: |-
@@ -9978,6 +10027,24 @@ spec:
                                         description: Kubelet's generated CSRs will
                                           be addressed to this signer.
                                         type: string
+                                      userAnnotations:
+                                        additionalProperties:
+                                          type: string
+                                        description: |-
+                                          userAnnotations allow pod authors to pass additional information to
+                                          the signer implementation.  Kubernetes does not restrict or validate this
+                                          metadata in any way.
+
+                                          These values are copied verbatim into the `spec.unverifiedUserAnnotations` field of
+                                          the PodCertificateRequest objects that Kubelet creates.
+
+                                          Entries are subject to the same validation as object metadata annotations,
+                                          with the addition that all keys must be domain-prefixed. No restrictions
+                                          are placed on values, except an overall size limitation on the entire field.
+
+                                          Signers should document the keys and values they support. Signers should
+                                          deny requests that contain keys they do not recognize.
+                                        type: object
                                     required:
                                     - keyType
                                     - signerName
@@ -27923,6 +27990,18 @@ rules:
   - create
   - get
   - update
+- apiGroups:
+  - gateway.networking.k8s.io
+  resources:
+  - httproutes
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
 - apiGroups:
   - image.openshift.io
   resources:

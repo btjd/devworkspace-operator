@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -101,6 +101,7 @@ func SetGlobalConfigForTesting(testConfig *controller.OperatorConfiguration) {
 	defer configMutex.Unlock()
 	setDefaultPodSecurityContext()
 	setDefaultContainerSecurityContext()
+	setDefaultOverrideConfig()
 	internalConfig = defaultConfig.DeepCopy()
 	mergeConfig(testConfig, internalConfig)
 }
@@ -113,6 +114,9 @@ func SetupControllerConfig(client crclient.Client) error {
 		return err
 	}
 	if err := setDefaultContainerSecurityContext(); err != nil {
+		return err
+	}
+	if err := setDefaultOverrideConfig(); err != nil {
 		return err
 	}
 
@@ -276,6 +280,9 @@ func mergeConfig(from, to *controller.OperatorConfiguration) {
 		}
 		if from.Routing.ClusterHostSuffix != "" {
 			to.Routing.ClusterHostSuffix = from.Routing.ClusterHostSuffix
+		}
+		if from.Routing.GatewayRef != nil {
+			to.Routing.GatewayRef = from.Routing.GatewayRef.DeepCopy()
 		}
 		if from.Routing.ProxyConfig != nil {
 			if to.Routing.ProxyConfig == nil {
@@ -506,6 +513,18 @@ func mergeConfig(from, to *controller.OperatorConfiguration) {
 			}
 			to.Workspace.InitContainers = initContainersCopy
 		}
+
+		if from.Workspace.Overrides != nil {
+			if to.Workspace.Overrides == nil {
+				to.Workspace.Overrides = &controller.OverrideConfig{}
+			}
+			if from.Workspace.Overrides.RestrictedContainerOverrideFields != nil {
+				to.Workspace.Overrides.RestrictedContainerOverrideFields = from.Workspace.Overrides.RestrictedContainerOverrideFields
+			}
+			if from.Workspace.Overrides.RestrictedPodOverrideFields != nil {
+				to.Workspace.Overrides.RestrictedPodOverrideFields = from.Workspace.Overrides.RestrictedPodOverrideFields
+			}
+		}
 	}
 }
 
@@ -619,6 +638,12 @@ func GetCurrentConfigString(currConfig *controller.OperatorConfiguration) string
 		}
 		if routing.DefaultRoutingClass != defaultConfig.Routing.DefaultRoutingClass {
 			config = append(config, fmt.Sprintf("routing.defaultRoutingClass=%s", routing.DefaultRoutingClass))
+		}
+		if routing.GatewayRef != nil {
+			config = append(config, fmt.Sprintf("routing.gatewayRef.name=%s", routing.GatewayRef.Name))
+			if routing.GatewayRef.Namespace != nil {
+				config = append(config, fmt.Sprintf("routing.gatewayRef.namespace=%s", *routing.GatewayRef.Namespace))
+			}
 		}
 	}
 	webhook := currConfig.Webhook
@@ -776,6 +801,14 @@ func GetCurrentConfigString(currConfig *controller.OperatorConfiguration) string
 		}
 		if workspace.HostUsers != nil {
 			config = append(config, fmt.Sprintf("workspace.hostUsers=%t", *workspace.HostUsers))
+		}
+		if workspace.Overrides != nil {
+			if workspace.Overrides.RestrictedContainerOverrideFields != nil {
+				config = append(config, fmt.Sprintf("workspace.overrides.restrictedContainerOverrideFields=[%s]", strings.Join(workspace.Overrides.RestrictedContainerOverrideFields, ", ")))
+			}
+			if workspace.Overrides.RestrictedPodOverrideFields != nil {
+				config = append(config, fmt.Sprintf("workspace.overrides.restrictedPodOverrideFields=[%s]", strings.Join(workspace.Overrides.RestrictedPodOverrideFields, ", ")))
+			}
 		}
 		if len(workspace.InitContainers) > 0 {
 			initContainerNames := make([]string, len(workspace.InitContainers))

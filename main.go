@@ -58,6 +58,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrl_webhook "sigs.k8s.io/controller-runtime/pkg/webhook"
+	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -79,6 +80,7 @@ func init() {
 	utilruntime.Must(controllerv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(dwv1.AddToScheme(scheme))
 	utilruntime.Must(dwv2.AddToScheme(scheme))
+	utilruntime.Must(gwapiv1.Install(scheme))
 
 	if infrastructure.IsOpenShift() {
 		utilruntime.Must(routev1.Install(scheme))
@@ -192,7 +194,7 @@ func main() {
 	if err = (&backupCronJobController.BackupCronJobReconciler{
 		Client:           mgr.GetClient(),
 		NonCachingClient: nonCachingClient,
-		Log:              ctrl.Log.WithName("controllers").WithName("BackupCronJob").V(1),
+		Log:              ctrl.Log.WithName("controllers").WithName("BackupCronJob"),
 		Scheme:           mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupCronJob")
@@ -213,10 +215,10 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).For(&dwv1.DevWorkspace{}).Complete(); err != nil {
+	if err := ctrl.NewWebhookManagedBy(mgr, &dwv1.DevWorkspace{}).Complete(); err != nil {
 		setupLog.Error(err, "failed creating conversion webhook for DevWorkspaces v1alpha1")
 	}
-	if err := ctrl.NewWebhookManagedBy(mgr).For(&dwv2.DevWorkspace{}).Complete(); err != nil {
+	if err := ctrl.NewWebhookManagedBy(mgr, &dwv2.DevWorkspace{}).Complete(); err != nil {
 		setupLog.Error(err, "failed creating conversion webhook for DevWorkspaces v1alpha2")
 	}
 
