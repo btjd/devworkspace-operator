@@ -15,7 +15,8 @@
 
 # https://access.redhat.com/containers/?tab=tags#/registry.access.redhat.com/ubi9/go-toolset
 # Use BUILDPLATFORM to ensure the builder always runs natively on the host machine
-FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.24.6-1758501173 AS builder
+# Image pinned by SHA256 to address GitHub security bot warnings about unpinned dependencies
+FROM --platform=$BUILDPLATFORM registry.access.redhat.com/ubi9/go-toolset:1.26.7-1789040808@sha256:685ccca486cc2c82b0818d835abecb1aed7a396e76ba416cfc47c28067f5d365 AS builder
 
 # Accept TARGETARCH and TARGETPLATFORM, which are automatically passed by the builder
 ARG TARGETARCH

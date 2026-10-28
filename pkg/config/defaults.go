@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -19,10 +19,13 @@ import (
 	"fmt"
 
 	"github.com/devfile/devworkspace-operator/apis/controller/v1alpha1"
+	"github.com/devfile/devworkspace-operator/pkg/constants"
 	"github.com/devfile/devworkspace-operator/pkg/infrastructure"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 )
 
@@ -55,8 +58,10 @@ var defaultConfig = &v1alpha1.OperatorConfiguration{
 		CleanupOnStop:            pointer.Bool(false),
 		PodSecurityContext:       nil, // Set per-platform in setDefaultPodSecurityContext()
 		ContainerSecurityContext: nil, // Set per-platform in setDefaultContainerSecurityContext()
+		NetworkPolicy:            nil, // Set per-platform in setDefaultNetworkPolicy()
 		DefaultTemplate:          nil,
 		ProjectCloneConfig: &v1alpha1.ProjectCloneConfig{
+			ImagePullPolicy: corev1.PullIfNotPresent,
 			Resources: &corev1.ResourceRequirements{
 				Limits: corev1.ResourceList{
 					corev1.ResourceMemory: resource.MustParse("1Gi"),
@@ -82,10 +87,10 @@ var defaultConfig = &v1alpha1.OperatorConfiguration{
 		},
 		DefaultContainerResources: &corev1.ResourceRequirements{
 			Limits: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("128Mi"),
+				corev1.ResourceMemory: resource.MustParse("256Mi"),
 			},
 			Requests: corev1.ResourceList{
-				corev1.ResourceMemory: resource.MustParse("64Mi"),
+				corev1.ResourceMemory: resource.MustParse("128Mi"),
 			},
 		},
 		CleanupCronJob: &v1alpha1.CleanupCronJobConfig{
@@ -97,7 +102,7 @@ var defaultConfig = &v1alpha1.OperatorConfiguration{
 		BackupCronJob: &v1alpha1.BackupCronJobConfig{
 			Enable:       pointer.Bool(false),
 			Schedule:     "0 0 1 * *",
-			BackoffLimit: pointer.Int32(3),
+			BackoffLimit: pointer.Int32(1),
 		},
 		// Do not declare a default value for this field.
 		// Setting a default leads to an endless reconcile loop when UserNamespacesSupport is disabled,
@@ -116,13 +121,63 @@ var (
 	}
 	defaultKubernetesContainerSecurityContext = &corev1.SecurityContext{}
 	defaultOpenShiftPodSecurityContext        = &corev1.PodSecurityContext{}
-	defaultOpenShiftContainerSecurityContext  = &corev1.SecurityContext{
+
+	defaultOpenShiftOverrideConfig = &v1alpha1.OverrideConfig{
+		RestrictedContainerOverrideFields: []string{},
+		RestrictedPodOverrideFields:       []string{},
+	}
+	defaultKubernetesOverrideConfig = &v1alpha1.OverrideConfig{
+		RestrictedContainerOverrideFields: []string{
+			"securityContext.privileged=true",
+			"securityContext.runAsNonRoot=false",
+			"securityContext.runAsUser=0",
+			"securityContext.allowPrivilegeEscalation=true",
+			"securityContext.procMount=Unmasked",
+			"securityContext.capabilities.add",
+		},
+		RestrictedPodOverrideFields: []string{
+			"hostNetwork=true",
+			"hostPID=true",
+			"hostIPC=true",
+			"securityContext.runAsNonRoot=false",
+			"securityContext.runAsUser=0",
+			"volumes.hostPath",
+		},
+	}
+
+	defaultOpenShiftContainerSecurityContext = &corev1.SecurityContext{
 		ReadOnlyRootFilesystem:   pointer.Bool(false),
 		RunAsNonRoot:             pointer.Bool(true),
 		AllowPrivilegeEscalation: pointer.Bool(false),
 		Capabilities: &corev1.Capabilities{
 			Drop: []corev1.Capability{
 				"ALL",
+			},
+		},
+	}
+
+	defaultEgressPolicyRules            = []networkingv1.NetworkPolicyEgressRule{{}}
+	defaultKubernetesIngressPolicyRules = []networkingv1.NetworkPolicyIngressRule{{}}
+	defaultOpenShiftIngressPolicyRules  = []networkingv1.NetworkPolicyIngressRule{
+		{
+			From: []networkingv1.NetworkPolicyPeer{
+				{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"network.openshift.io/policy-group": "monitoring"}}},
+			},
+		},
+		{
+			From: []networkingv1.NetworkPolicyPeer{
+				{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"network.openshift.io/policy-group": "ingress"}}},
+			},
+		},
+		{
+			From: []networkingv1.NetworkPolicyPeer{
+				{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"policy-group.network.openshift.io/host-network": ""}}},
+			},
+		},
+		{
+			// Needed for WebTerminal
+			From: []networkingv1.NetworkPolicyPeer{
+				{NamespaceSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"network.openshift.io/policy-group": "console"}}},
 			},
 		},
 	}
@@ -156,4 +211,92 @@ func setDefaultContainerSecurityContext() error {
 		defaultConfig.Workspace.ContainerSecurityContext = defaultKubernetesContainerSecurityContext
 	}
 	return nil
+}
+
+func setDefaultOverrideConfig() error {
+	if !infrastructure.IsInitialized() {
+		return fmt.Errorf("can not set default override config, infrastructure not detected")
+	}
+	if infrastructure.IsOpenShift() {
+		defaultConfig.Workspace.Overrides = defaultOpenShiftOverrideConfig
+	} else {
+		defaultConfig.Workspace.Overrides = defaultKubernetesOverrideConfig
+	}
+	return nil
+}
+
+func setDefaultNetworkPolicy() error {
+	if !infrastructure.IsInitialized() {
+		return fmt.Errorf("can not set default network policy, infrastructure not detected")
+	}
+	operatorNamespace, err := infrastructure.GetNamespace()
+	if err != nil {
+		return err
+	}
+
+	ingress, egress, err := GetDefaultNetworkPolicy(operatorNamespace)
+	if err != nil {
+		return err
+	}
+
+	defaultConfig.Workspace.NetworkPolicy = &v1alpha1.NetworkPolicyConfig{
+		Enabled: pointer.Bool(constants.DefaultNetworkPolicyEnabled),
+		Ingress: ingress,
+		Egress:  egress,
+	}
+	return nil
+}
+
+// GetDefaultNetworkPolicy returns the default NetworkPolicy applied to DevWorkspace pods.
+// It is exposed publicly for other operators (such as che-operator) that need to read
+// and extend the default rules rather than hardcoding or duplicating them.
+func GetDefaultNetworkPolicy(operatorNamespace string) (
+	[]networkingv1.NetworkPolicyIngressRule,
+	[]networkingv1.NetworkPolicyEgressRule,
+	error,
+) {
+	var ingressPolicyRules []networkingv1.NetworkPolicyIngressRule
+	if infrastructure.IsOpenShift() {
+		allowFromDevWorkspaceIngressPolicyRule := networkingv1.NetworkPolicyIngressRule{
+			From: []networkingv1.NetworkPolicyPeer{
+				{
+					NamespaceSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"kubernetes.io/metadata.name": operatorNamespace},
+					},
+					PodSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app.kubernetes.io/part-of": "devworkspace-operator"},
+					},
+				},
+			},
+		}
+		ingressPolicyRules = []networkingv1.NetworkPolicyIngressRule{allowFromDevWorkspaceIngressPolicyRule}
+		ingressPolicyRules = append(ingressPolicyRules, defaultOpenShiftIngressPolicyRules...)
+	} else {
+		ingressPolicyRules = defaultKubernetesIngressPolicyRules
+	}
+
+	// Return copies so callers can extend the rules without mutating package-level defaults
+	return deepCopyIngressRules(ingressPolicyRules), deepCopyEgressRules(defaultEgressPolicyRules), nil
+}
+
+func deepCopyIngressRules(rules []networkingv1.NetworkPolicyIngressRule) []networkingv1.NetworkPolicyIngressRule {
+	if rules == nil {
+		return nil
+	}
+	copied := make([]networkingv1.NetworkPolicyIngressRule, len(rules))
+	for i := range rules {
+		rules[i].DeepCopyInto(&copied[i])
+	}
+	return copied
+}
+
+func deepCopyEgressRules(rules []networkingv1.NetworkPolicyEgressRule) []networkingv1.NetworkPolicyEgressRule {
+	if rules == nil {
+		return nil
+	}
+	copied := make([]networkingv1.NetworkPolicyEgressRule, len(rules))
+	for i := range rules {
+		rules[i].DeepCopyInto(&copied[i])
+	}
+	return copied
 }

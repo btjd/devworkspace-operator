@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -101,6 +101,8 @@ func SetGlobalConfigForTesting(testConfig *controller.OperatorConfiguration) {
 	defer configMutex.Unlock()
 	setDefaultPodSecurityContext()
 	setDefaultContainerSecurityContext()
+	setDefaultOverrideConfig()
+	setDefaultNetworkPolicy()
 	internalConfig = defaultConfig.DeepCopy()
 	mergeConfig(testConfig, internalConfig)
 }
@@ -115,7 +117,12 @@ func SetupControllerConfig(client crclient.Client) error {
 	if err := setDefaultContainerSecurityContext(); err != nil {
 		return err
 	}
-
+	if err := setDefaultOverrideConfig(); err != nil {
+		return err
+	}
+	if err := setDefaultNetworkPolicy(); err != nil {
+		return err
+	}
 	internalConfig = &controller.OperatorConfiguration{}
 
 	namespace, err := infrastructure.GetNamespace()
@@ -276,6 +283,9 @@ func mergeConfig(from, to *controller.OperatorConfiguration) {
 		}
 		if from.Routing.ClusterHostSuffix != "" {
 			to.Routing.ClusterHostSuffix = from.Routing.ClusterHostSuffix
+		}
+		if from.Routing.GatewayRef != nil {
+			to.Routing.GatewayRef = from.Routing.GatewayRef.DeepCopy()
 		}
 		if from.Routing.ProxyConfig != nil {
 			if to.Routing.ProxyConfig == nil {
@@ -506,6 +516,32 @@ func mergeConfig(from, to *controller.OperatorConfiguration) {
 			}
 			to.Workspace.InitContainers = initContainersCopy
 		}
+
+		if from.Workspace.Overrides != nil {
+			if to.Workspace.Overrides == nil {
+				to.Workspace.Overrides = &controller.OverrideConfig{}
+			}
+			if from.Workspace.Overrides.RestrictedContainerOverrideFields != nil {
+				to.Workspace.Overrides.RestrictedContainerOverrideFields = from.Workspace.Overrides.RestrictedContainerOverrideFields
+			}
+			if from.Workspace.Overrides.RestrictedPodOverrideFields != nil {
+				to.Workspace.Overrides.RestrictedPodOverrideFields = from.Workspace.Overrides.RestrictedPodOverrideFields
+			}
+		}
+		if from.Workspace.NetworkPolicy != nil {
+			if to.Workspace.NetworkPolicy == nil {
+				to.Workspace.NetworkPolicy = &controller.NetworkPolicyConfig{}
+			}
+			if from.Workspace.NetworkPolicy.Enabled != nil {
+				to.Workspace.NetworkPolicy.Enabled = from.Workspace.NetworkPolicy.Enabled
+			}
+			if from.Workspace.NetworkPolicy.Ingress != nil {
+				to.Workspace.NetworkPolicy.Ingress = from.Workspace.NetworkPolicy.Ingress
+			}
+			if from.Workspace.NetworkPolicy.Egress != nil {
+				to.Workspace.NetworkPolicy.Egress = from.Workspace.NetworkPolicy.Egress
+			}
+		}
 	}
 }
 
@@ -620,6 +656,12 @@ func GetCurrentConfigString(currConfig *controller.OperatorConfiguration) string
 		if routing.DefaultRoutingClass != defaultConfig.Routing.DefaultRoutingClass {
 			config = append(config, fmt.Sprintf("routing.defaultRoutingClass=%s", routing.DefaultRoutingClass))
 		}
+		if routing.GatewayRef != nil {
+			config = append(config, fmt.Sprintf("routing.gatewayRef.name=%s", routing.GatewayRef.Name))
+			if routing.GatewayRef.Namespace != nil {
+				config = append(config, fmt.Sprintf("routing.gatewayRef.namespace=%s", *routing.GatewayRef.Namespace))
+			}
+		}
 	}
 	webhook := currConfig.Webhook
 	if webhook != nil {
@@ -648,6 +690,9 @@ func GetCurrentConfigString(currConfig *controller.OperatorConfiguration) string
 		}
 		if workspace.DeploymentStrategy != defaultConfig.Workspace.DeploymentStrategy {
 			config = append(config, fmt.Sprintf("workspace.deploymentStrategy=%s", workspace.DeploymentStrategy))
+		}
+		if workspace.NetworkPolicy != nil && pointer.BoolDeref(workspace.NetworkPolicy.Enabled, constants.DefaultNetworkPolicyEnabled) {
+			config = append(config, "workspace.networkPolicy.enabled=true")
 		}
 		if workspace.PVCName != defaultConfig.Workspace.PVCName {
 			config = append(config, fmt.Sprintf("workspace.pvcName=%s", workspace.PVCName))
@@ -776,6 +821,14 @@ func GetCurrentConfigString(currConfig *controller.OperatorConfiguration) string
 		}
 		if workspace.HostUsers != nil {
 			config = append(config, fmt.Sprintf("workspace.hostUsers=%t", *workspace.HostUsers))
+		}
+		if workspace.Overrides != nil {
+			if workspace.Overrides.RestrictedContainerOverrideFields != nil {
+				config = append(config, fmt.Sprintf("workspace.overrides.restrictedContainerOverrideFields=[%s]", strings.Join(workspace.Overrides.RestrictedContainerOverrideFields, ", ")))
+			}
+			if workspace.Overrides.RestrictedPodOverrideFields != nil {
+				config = append(config, fmt.Sprintf("workspace.overrides.restrictedPodOverrideFields=[%s]", strings.Join(workspace.Overrides.RestrictedPodOverrideFields, ", ")))
+			}
 		}
 		if len(workspace.InitContainers) > 0 {
 			initContainerNames := make([]string, len(workspace.InitContainers))

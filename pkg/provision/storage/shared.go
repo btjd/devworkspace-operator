@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -16,6 +16,7 @@
 package storage
 
 import (
+	"context"
 	"errors"
 	"fmt"
 
@@ -27,6 +28,7 @@ import (
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -34,6 +36,7 @@ import (
 	"github.com/devfile/devworkspace-operator/pkg/constants"
 	devfileConstants "github.com/devfile/devworkspace-operator/pkg/library/constants"
 	containerlib "github.com/devfile/devworkspace-operator/pkg/library/container"
+	"github.com/devfile/devworkspace-operator/pkg/library/overrides"
 	nsconfig "github.com/devfile/devworkspace-operator/pkg/provision/config"
 )
 
@@ -266,6 +269,60 @@ func getSharedPVCWorkspaceCount(namespace string, api sync.ClusterAPI) (total in
 	return total, nil
 }
 
+// FindNodeForPVC lists DevWorkspace pods in the given namespace and returns the
+// node name where a running pod mounts the specified PVC. Returns an empty
+// string (and nil error) when no such pod is found.
+func FindNodeForPVC(ctx context.Context, k8sClient client.Client, namespace, pvcName string) (string, error) {
+	labelSelector, err := labels.Parse(constants.DevWorkspaceIDLabel)
+	if err != nil {
+		return "", err
+	}
+	podList := &corev1.PodList{}
+	if err := k8sClient.List(ctx, podList, &client.ListOptions{
+		Namespace:     namespace,
+		LabelSelector: labelSelector,
+	}); err != nil {
+		return "", err
+	}
+	return getNodeNameWithPVC(podList, pvcName), nil
+}
+
+// NodeAffinityForHostname returns an Affinity that pins a pod to the given node
+// using the kubernetes.io/hostname label. Used by both cleanup and backup Jobs
+// to avoid Multi-Attach errors with ReadWriteOnce PVCs on multi-node clusters.
+func NodeAffinityForHostname(nodeName string) *corev1.Affinity {
+	return &corev1.Affinity{
+		NodeAffinity: &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{
+					{
+						MatchExpressions: []corev1.NodeSelectorRequirement{
+							{
+								Key:      corev1.LabelHostname,
+								Operator: corev1.NodeSelectorOpIn,
+								Values:   []string{nodeName},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+func getNodeNameWithPVC(list *corev1.PodList, pvcName string) string {
+	for _, pod := range list.Items {
+		if pod.Status.Phase == corev1.PodRunning {
+			for _, volume := range pod.Spec.Volumes {
+				if volume.PersistentVolumeClaim != nil && volume.PersistentVolumeClaim.ClaimName == pvcName {
+					return pod.Spec.NodeName
+				}
+			}
+		}
+	}
+	return ""
+}
+
 func checkPVCTerminating(name, namespace string, api sync.ClusterAPI) (bool, error) {
 	if name == "" {
 		// Should not happen
@@ -281,4 +338,92 @@ func checkPVCTerminating(name, namespace string, api sync.ClusterAPI) (bool, err
 		return false, err
 	}
 	return pvc.DeletionTimestamp != nil, nil
+}
+
+// rewriteContainerVolumeMounts rewrites the VolumeMounts in a set of PodAdditions so that each non-ephemeral
+// volume mount becomes a subpath into the provided PVC. The subpath for each mount is computed by subPathFunc,
+// allowing callers to implement the different PVC strategies (e.g. workspace-id-prefixed subpaths for the common
+// strategy, and bare volume-name subpaths for the per-workspace strategy).
+//
+// It also adds the PVC-backed k8s Volume to podAdditions to accommodate the rewritten VolumeMounts.
+// Must be called at most once per PodAdditions: the PVC-backed Volume is appended unconditionally.
+func rewriteContainerVolumeMounts(
+	workspaceId, pvcName string,
+	podAdditions *v1alpha1.PodAdditions,
+	workspace *dw.DevWorkspaceTemplateSpec,
+	restrictedFields []string,
+	subPathFunc func(workspaceId, volumeName string) string,
+) error {
+	devfileVolumes := map[string]dw.VolumeComponent{}
+
+	// Construct map of volume name -> volume Component
+	for _, component := range workspace.Components {
+		if component.Volume != nil {
+			if _, exists := devfileVolumes[component.Name]; exists {
+				return fmt.Errorf("volume component '%s' is defined multiple times", component.Name)
+			}
+			devfileVolumes[component.Name] = *component.Volume
+		}
+	}
+
+	// Containers in podAdditions may reference e.g. automounted volumes in their volumeMounts, and this is not an error
+	additionalVolumes := map[string]bool{}
+	for _, additionalVolume := range podAdditions.Volumes {
+		additionalVolumes[additionalVolume.Name] = true
+	}
+
+	// Containers in podAdditions may reference volumes defined in pod overrides, and this is not an error
+	overridesVolumes, err := overrides.GetVolumesFromOverrides(workspace, restrictedFields)
+	if err != nil {
+		return err
+	}
+	for volumeName, present := range overridesVolumes {
+		additionalVolumes[volumeName] = present
+	}
+
+	// Add implicit projects volume to support mountSources, if needed
+	if _, exists := devfileVolumes[devfileConstants.ProjectsVolumeName]; !exists {
+		projectsVolume := dw.VolumeComponent{}
+		projectsVolume.Size = constants.PVCStorageSize
+		devfileVolumes[devfileConstants.ProjectsVolumeName] = projectsVolume
+	}
+
+	// TODO: What should we do when a volume isn't explicitly defined?
+	rewriteVolumeMounts := func(containers []corev1.Container) error {
+		for cIdx, container := range containers {
+			for vmIdx, vm := range container.VolumeMounts {
+				volume, ok := devfileVolumes[vm.Name]
+				if !ok {
+					// Volume is defined outside of the devfile
+					if additionalVolumes[vm.Name] {
+						continue
+					}
+					// Should never happen as flattened Devfile is validated.
+					return fmt.Errorf("container '%s' references undefined volume '%s'", container.Name, vm.Name)
+				}
+				if !isEphemeral(&volume) {
+					containers[cIdx].VolumeMounts[vmIdx].SubPath = subPathFunc(workspaceId, vm.Name)
+					containers[cIdx].VolumeMounts[vmIdx].Name = pvcName
+				}
+			}
+		}
+		return nil
+	}
+	if err := rewriteVolumeMounts(podAdditions.Containers); err != nil {
+		return err
+	}
+	if err := rewriteVolumeMounts(podAdditions.InitContainers); err != nil {
+		return err
+	}
+
+	podAdditions.Volumes = append(podAdditions.Volumes, corev1.Volume{
+		Name: pvcName,
+		VolumeSource: corev1.VolumeSource{
+			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
+				ClaimName: pvcName,
+			},
+		},
+	})
+
+	return nil
 }

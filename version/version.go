@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -17,7 +17,7 @@ package version
 
 var (
 	// Version is the operator version
-	Version = "v0.40.0-dev"
+	Version = "v1.1.0-dev"
 	// Commit is the commit hash corresponding to the code that was built. Can be suffixed with `-dirty`
 	Commit string = "unknown"
 	// BuildTime is the time of build of the binary

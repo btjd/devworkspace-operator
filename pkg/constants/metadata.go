@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -49,6 +49,28 @@ const (
 	// DevWorkspaceMountLabel is the label key to store if a configmap, secret, or PVC should be mounted to the devworkspace
 	DevWorkspaceMountLabel = "controller.devfile.io/mount-to-devworkspace"
 
+	// DevWorkspaceMountIncludeAnnotation is an annotation to configure which DevWorkspaces an automount
+	// resource should be mounted to. The value is a comma-separated list of patterns matched against
+	// the DevWorkspace name. The resource is only mounted to workspaces whose name matches at least one pattern.
+	// Supported patterns:
+	// - exact match `name`
+	// - prefix match `name*`
+	// - suffix match `*name`
+	// - contains match `*name*`
+	// - matches all workspaces `*`
+	DevWorkspaceMountIncludeAnnotation = "controller.devfile.io/mount-to-devworkspace-include"
+
+	// DevWorkspaceMountExcludeAnnotation is an annotation to configure which DevWorkspaces an automount
+	// resource should NOT be mounted to. The value is a comma-separated list of patterns matched against
+	// the DevWorkspace name. The resource is not mounted to workspaces whose name matches any pattern.
+	// Supported patterns:
+	// - exact match `name`
+	// - prefix match `name*`
+	// - suffix match `*name`
+	// - contains match `*name*`
+	// - matches all workspaces `*`
+	DevWorkspaceMountExcludeAnnotation = "controller.devfile.io/mount-to-devworkspace-exclude"
+
 	// DevWorkspaceMountPathAnnotation is the annotation key to store the mount path for the secret or configmap.
 	// If no mount path is provided, configmaps will be mounted at /etc/config/<configmap-name>, secrets will
 	// be mounted at /etc/secret/<secret-name>, and persistent volume claims will be mounted to /tmp/<claim-name>
@@ -70,6 +92,14 @@ const (
 	// secrets mounted using the 'controller.devfile.io/mount-to-devworkspace' annotation. The access mode annotation
 	// can either be specified as a decimal (e.g. '416') or as an octal by prefixing the number with zero (e.g. '0640')
 	DevWorkspaceMountAccessModeAnnotation = "controller.devfile.io/mount-access-mode"
+
+	// DevWorkspaceValidatedK8sResourcesAnnotation is the annotation key used to store the list of
+	// Kubernetes resources that have been validated by the mutating webhook via SubjectAccessReview.
+	// The controller uses this to determine which objects the workspace creator is authorized to create.
+	DevWorkspaceValidatedK8sResourcesAnnotation = "controller.devfile.io/validated-kubernetes-resources"
+	// DevWorkspaceValidatedSCCAnnotation is the annotation key used to store the SecurityContextConstraints
+	// that have been validated by the mutating webhook via SubjectAccessReview.
+	DevWorkspaceValidatedSCCAnnotation = "controller.devfile.io/validated-scc"
 
 	// DevWorkspaceGitCredentialLabel is the label key to specify if the secret is a git credential. All secrets who
 	// specify this label in a namespace will consolidate into one secret before mounting into a devworkspace.
@@ -139,10 +169,10 @@ const (
 	// fails to start (i.e. enters the "Failed" phase), its deployment will not be scaled down in order to allow viewing logs, etc.
 	DevWorkspaceDebugStartAnnotation = "controller.devfile.io/debug-start"
 
-	// WebhookRestartedAtAnnotation holds the the time (unixnano) of when the webhook server was forced to restart by controller
+	// WebhookRestartedAtAnnotation holds the time (unixnano) of when the webhook server was forced to restart by controller
 	WebhookRestartedAtAnnotation = "controller.devfile.io/restarted-at"
 
-	// DevWorkspaceStartedAtAnnotation holds the the time (unixnano) of when the devworkspace was started
+	// DevWorkspaceStartedAtAnnotation holds the time (unixnano) of when the devworkspace was started
 	DevWorkspaceStartedAtAnnotation = "controller.devfile.io/started-at"
 
 	// RoutingAnnotationInfix is the infix of the annotations of DevWorkspace that are passed down as annotation to the DevWorkspaceRouting objects.

@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -24,8 +24,7 @@ import (
 	"github.com/devfile/devworkspace-operator/pkg/common"
 	"github.com/devfile/devworkspace-operator/pkg/constants"
 	"github.com/devfile/devworkspace-operator/pkg/dwerrors"
-	devfileConstants "github.com/devfile/devworkspace-operator/pkg/library/constants"
-	"github.com/devfile/devworkspace-operator/pkg/library/overrides"
+	"github.com/devfile/devworkspace-operator/pkg/library/overrides/restrictions"
 	nsconfig "github.com/devfile/devworkspace-operator/pkg/provision/config"
 	"github.com/devfile/devworkspace-operator/pkg/provision/sync"
 	corev1 "k8s.io/api/core/v1"
@@ -72,7 +71,13 @@ func (p *PerWorkspaceStorageProvisioner) ProvisionStorage(podAdditions *v1alpha1
 	}
 
 	// Rewrite container volume mounts
-	if err := p.rewriteContainerVolumeMounts(workspace.Status.DevWorkspaceId, pvcName, podAdditions, &workspace.Spec.Template); err != nil {
+	if err := p.rewriteContainerVolumeMounts(
+		workspace.Status.DevWorkspaceId,
+		pvcName,
+		podAdditions,
+		&workspace.Spec.Template,
+		restrictions.GetRestrictedPodFields(workspace),
+	); err != nil {
 		return &dwerrors.FailError{
 			Err:     err,
 			Message: "Could not rewrite container volume mounts",
@@ -91,79 +96,16 @@ func (*PerWorkspaceStorageProvisioner) CleanupWorkspaceStorage(workspace *common
 // (i.e. all volume mounts are subpaths into a PVC used by a single workspace in the namespace).
 //
 // Also adds appropriate k8s Volumes to PodAdditions to accomodate the rewritten VolumeMounts.
-func (p *PerWorkspaceStorageProvisioner) rewriteContainerVolumeMounts(workspaceId, pvcName string, podAdditions *v1alpha1.PodAdditions, workspace *dw.DevWorkspaceTemplateSpec) error {
-	devfileVolumes := map[string]dw.VolumeComponent{}
-
-	// Construct map of volume name -> volume Component
-	for _, component := range workspace.Components {
-		if component.Volume != nil {
-			if _, exists := devfileVolumes[component.Name]; exists {
-				return fmt.Errorf("volume component '%s' is defined multiple times", component.Name)
-			}
-			devfileVolumes[component.Name] = *component.Volume
-		}
-	}
-
-	// Containers in podAdditions may reference e.g. automounted volumes in their volumeMounts, and this is not an error
-	additionalVolumes := map[string]bool{}
-	for _, additionalVolume := range podAdditions.Volumes {
-		additionalVolumes[additionalVolume.Name] = true
-	}
-
-	// Containers in podAdditions may reference volumes defined in pod overrides, and this is not an error
-	overridesVolumes, err := overrides.GetVolumesFromOverrides(workspace)
-	if err != nil {
-		return err
-	}
-	for volumeName, present := range overridesVolumes {
-		additionalVolumes[volumeName] = present
-	}
-
-	// Add implicit projects volume to support mountSources, if needed
-	if _, exists := devfileVolumes[devfileConstants.ProjectsVolumeName]; !exists {
-		projectsVolume := dw.VolumeComponent{}
-		projectsVolume.Size = constants.PVCStorageSize
-		devfileVolumes[devfileConstants.ProjectsVolumeName] = projectsVolume
-	}
-
-	// TODO: What should we do when a volume isn't explicitly defined?
-	rewriteVolumeMounts := func(containers []corev1.Container) error {
-		for cIdx, container := range containers {
-			for vmIdx, vm := range container.VolumeMounts {
-				volume, ok := devfileVolumes[vm.Name]
-				if !ok {
-					// Volume is defined outside of the devfile
-					if additionalVolumes[vm.Name] {
-						continue
-					}
-					// Should never happen as flattened Devfile is validated.
-					return fmt.Errorf("container '%s' references undefined volume '%s'", container.Name, vm.Name)
-				}
-				if !isEphemeral(&volume) {
-					containers[cIdx].VolumeMounts[vmIdx].SubPath = vm.Name
-					containers[cIdx].VolumeMounts[vmIdx].Name = pvcName
-				}
-			}
-		}
-		return nil
-	}
-	if err := rewriteVolumeMounts(podAdditions.Containers); err != nil {
-		return err
-	}
-	if err := rewriteVolumeMounts(podAdditions.InitContainers); err != nil {
-		return err
-	}
-
-	podAdditions.Volumes = append(podAdditions.Volumes, corev1.Volume{
-		Name: pvcName,
-		VolumeSource: corev1.VolumeSource{
-			PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{
-				ClaimName: pvcName,
-			},
-		},
-	})
-
-	return nil
+func (p *PerWorkspaceStorageProvisioner) rewriteContainerVolumeMounts(
+	workspaceId, pvcName string,
+	podAdditions *v1alpha1.PodAdditions,
+	workspace *dw.DevWorkspaceTemplateSpec,
+	restrictedFields []string,
+) error {
+	return rewriteContainerVolumeMounts(workspaceId, pvcName, podAdditions, workspace, restrictedFields,
+		func(_, volumeName string) string {
+			return volumeName
+		})
 }
 
 func getPVCSize(workspace *common.DevWorkspaceWithConfig, namespacedConfig *nsconfig.NamespacedConfig) (*resource.Quantity, error) {

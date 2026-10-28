@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -27,6 +27,7 @@ import (
 	dw "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	"github.com/devfile/devworkspace-operator/pkg/common"
 	"github.com/devfile/devworkspace-operator/pkg/dwerrors"
+	"github.com/devfile/devworkspace-operator/pkg/httpfactory"
 	"github.com/devfile/devworkspace-operator/pkg/provision/sync"
 
 	"github.com/go-logr/logr"
@@ -210,10 +211,16 @@ func checkServerStatus(workspace *common.DevWorkspaceWithConfig) (ok bool, respo
 	}
 	healthz.Path = path.Join(healthz.Path, "healthz")
 
+	healthCheckHttpClient := httpfactory.HttpFactory.GetHealthCheckHttpClient()
 	resp, err := healthCheckHttpClient.Get(healthz.String())
 	if err != nil {
 		return false, nil, &dwerrors.RetryError{Err: err, Message: "Failed to check server status", RequeueAfter: 1 * time.Second}
 	}
+
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
 	if (resp.StatusCode / 100) == 4 {
 		// Assume endpoint is unimplemented and/or * is covered with authentication.
 		return true, &resp.StatusCode, nil

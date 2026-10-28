@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,6 +22,7 @@ import (
 	"os"
 	"runtime"
 
+	"github.com/devfile/devworkspace-operator/pkg/httpfactory"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
 
 	"github.com/devfile/devworkspace-operator/controllers/controller/devworkspacerouting"
@@ -30,6 +31,7 @@ import (
 	"github.com/devfile/devworkspace-operator/pkg/config"
 	"github.com/devfile/devworkspace-operator/pkg/infrastructure"
 	kubesync "github.com/devfile/devworkspace-operator/pkg/library/kubernetes"
+	"github.com/devfile/devworkspace-operator/pkg/tlssetup"
 	"github.com/devfile/devworkspace-operator/pkg/webhook"
 	"github.com/devfile/devworkspace-operator/version"
 
@@ -58,6 +60,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	ctrl_webhook "sigs.k8s.io/controller-runtime/pkg/webhook"
+	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 	// +kubebuilder:scaffold:imports
 )
 
@@ -79,6 +82,7 @@ func init() {
 	utilruntime.Must(controllerv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(dwv1.AddToScheme(scheme))
 	utilruntime.Must(dwv2.AddToScheme(scheme))
+	utilruntime.Must(gwapiv1.Install(scheme))
 
 	if infrastructure.IsOpenShift() {
 		utilruntime.Must(routev1.Install(scheme))
@@ -116,6 +120,13 @@ func main() {
 		setupLog.Error(err, "failed to initialized Kubernetes objects decoder")
 	}
 
+	serverTLS, err := tlssetup.BuildServerTLSOptions(
+		context.Background(), ctrl.GetConfigOrDie(), scheme, setupLog)
+	if err != nil {
+		setupLog.Error(err, "failed to build TLS options from cluster TLS profile")
+		os.Exit(1)
+	}
+
 	cacheFunc, err := cache.GetCacheFunc()
 	if err != nil {
 		setupLog.Error(err, "failed to set up objects cache")
@@ -128,9 +139,11 @@ func main() {
 			BindAddress:    metricsAddr,
 			FilterProvider: filters.WithAuthenticationAndAuthorization,
 			SecureServing:  true,
+			TLSOpts:        serverTLS.TLSOpts,
 		},
 		WebhookServer: ctrl_webhook.NewServer(ctrl_webhook.Options{
-			Port: 9443,
+			Port:    9443,
+			TLSOpts: serverTLS.TLSOpts,
 		}),
 		HealthProbeBindAddress: ":6789",
 		LeaderElection:         enableLeaderElection,
@@ -143,6 +156,12 @@ func main() {
 	}
 	if err = setupControllerConfig(mgr); err != nil {
 		setupLog.Error(err, "unable to read controller configuration")
+		os.Exit(1)
+	}
+
+	err = httpfactory.SetupHttpClientsFactory(mgr.GetClient(), mgr.GetLogger())
+	if err != nil {
+		setupLog.Error(err, "Failed to setup Http clients factory")
 		os.Exit(1)
 	}
 
@@ -192,7 +211,7 @@ func main() {
 	if err = (&backupCronJobController.BackupCronJobReconciler{
 		Client:           mgr.GetClient(),
 		NonCachingClient: nonCachingClient,
-		Log:              ctrl.Log.WithName("controllers").WithName("BackupCronJob").V(1),
+		Log:              ctrl.Log.WithName("controllers").WithName("BackupCronJob"),
 		Scheme:           mgr.GetScheme(),
 	}).SetupWithManager(mgr); err != nil {
 		setupLog.Error(err, "unable to create controller", "controller", "BackupCronJob")
@@ -213,11 +232,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	if err := ctrl.NewWebhookManagedBy(mgr).For(&dwv1.DevWorkspace{}).Complete(); err != nil {
+	if err := ctrl.NewWebhookManagedBy(mgr, &dwv1.DevWorkspace{}).Complete(); err != nil {
 		setupLog.Error(err, "failed creating conversion webhook for DevWorkspaces v1alpha1")
 	}
-	if err := ctrl.NewWebhookManagedBy(mgr).For(&dwv2.DevWorkspace{}).Complete(); err != nil {
+	if err := ctrl.NewWebhookManagedBy(mgr, &dwv2.DevWorkspace{}).Complete(); err != nil {
 		setupLog.Error(err, "failed creating conversion webhook for DevWorkspaces v1alpha2")
+	}
+
+	// On OpenShift, watch cluster TLS profile and restart if it changes.
+	signalCtx := ctrl.SetupSignalHandler()
+	ctx, cancelCtx := context.WithCancel(signalCtx)
+	defer cancelCtx()
+
+	if err := tlssetup.RegisterSecurityProfileWatcher(mgr, serverTLS, cancelCtx, setupLog); err != nil {
+		setupLog.Error(err, "unable to set up TLS security profile watcher")
+		os.Exit(1)
 	}
 
 	// Setup health check
@@ -233,7 +262,7 @@ func main() {
 	}
 
 	setupLog.Info("starting manager")
-	if err := mgr.Start(ctrl.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		setupLog.Error(err, "problem running manager")
 		os.Exit(1)
 	}

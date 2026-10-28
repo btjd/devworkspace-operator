@@ -15,12 +15,40 @@
 
 FROM registry.ci.openshift.org/openshift/release:rhel-9-release-golang-1.24-openshift-4.20
 
+ENV GO_VERSION=1.26.7
+ENV GOROOT=/usr/local/go
+ENV PATH=$GOROOT/bin:$PATH
+
+ENV GO_VERSION=1.26.7
+ENV GOROOT=/usr/local/go
+ENV PATH=$GOROOT/bin:$PATH
+
 SHELL ["/bin/bash", "-c"]
+
+# Install Go 1.26.7 to satisfy go.mod toolchain requirement (go 1.26.0)
+RUN export ARCH="$(uname -m)" && if [[ ${ARCH} == "x86_64" ]]; then export ARCH="amd64"; elif [[ ${ARCH} == "aarch64" ]]; then export ARCH="arm64"; fi && \
+    curl -fsSL "https://go.dev/dl/go${GO_VERSION}.linux-${ARCH}.tar.gz" -o go.tar.gz && \
+    rm -rf /usr/local/go && \
+    tar -C /usr/local -xzf go.tar.gz && \
+    rm go.tar.gz && \
+    ln -sf /usr/local/go/bin/go /usr/bin/go.real && \
+    ln -sf /usr/local/go/bin/gofmt /usr/bin/gofmt
+RUN go version
+
+ENV NODE_VERSION=22.12.0
+RUN export ARCH="$(uname -m)" && if [[ ${ARCH} == "x86_64" ]]; then export ARCH="x64"; elif [[ ${ARCH} == "aarch64" ]]; then export ARCH="arm64"; fi && \
+    curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${ARCH}.tar.xz" -o node.tar.xz && \
+    tar -C /usr/local -xJf node.tar.xz && \
+    rm node.tar.xz && \
+    ln -sf /usr/local/node-v${NODE_VERSION}-linux-*/bin/node /usr/bin/node && \
+    ln -sf /usr/local/node-v${NODE_VERSION}-linux-*/bin/npm /usr/bin/npm && \
+    ln -sf /usr/local/node-v${NODE_VERSION}-linux-*/bin/npx /usr/bin/npx
+RUN node --version && npm --version
 
 # Temporary workaround since mirror.centos.org is down and can be replaced with vault.centos.org
 RUN sed -i s/mirror.centos.org/vault.centos.org/g /etc/yum.repos.d/*.repo && sed -i s/^#.*baseurl=http/baseurl=http/g /etc/yum.repos.d/*.repo && sed -i s/^mirrorlist=http/#mirrorlist=http/g /etc/yum.repos.d/*.repo
 
-RUN yum install --assumeyes -d1 python3-pip nodejs gettext jq && \
+RUN yum install --assumeyes -d1 python3-pip gettext jq && \
     pip3 install --upgrade pip && \
     pip3 install --ignore-installed --upgrade setuptools && \
     # Install yq and jq

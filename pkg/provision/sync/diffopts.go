@@ -24,6 +24,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 var roleDiffOpts = cmp.Options{
@@ -39,6 +41,7 @@ var rolebindingDiffOpts = cmp.Options{
 var deploymentDiffOpts = cmp.Options{
 	cmpopts.IgnoreFields(appsv1.Deployment{}, "TypeMeta", "ObjectMeta", "Status"),
 	cmpopts.IgnoreFields(appsv1.DeploymentSpec{}, "RevisionHistoryLimit", "ProgressDeadlineSeconds"),
+	cmpopts.IgnoreFields(metav1.ObjectMeta{}, "Labels", "Annotations"),
 	cmpopts.IgnoreFields(corev1.PodSpec{}, "DNSPolicy", "SchedulerName", "DeprecatedServiceAccount"),
 	cmpopts.IgnoreFields(corev1.Container{}, "TerminationMessagePath", "TerminationMessagePolicy", "ImagePullPolicy"),
 	cmpopts.SortSlices(func(a, b corev1.Container) bool {
@@ -90,6 +93,17 @@ var routeDiffOpts = cmp.Options{
 var ingressDiffOpts = cmp.Options{
 	cmpopts.IgnoreFields(networkingv1.Ingress{}, "TypeMeta", "ObjectMeta", "Status"),
 	cmpopts.IgnoreFields(networkingv1.HTTPIngressPath{}, "PathType"),
+}
+
+var networkPolicyDiffOpts = cmp.Options{
+	cmpopts.IgnoreFields(networkingv1.NetworkPolicy{}, "TypeMeta", "ObjectMeta"),
+}
+
+var httpRouteDiffOpts = cmp.Options{
+	cmpopts.IgnoreFields(gwapiv1.HTTPRoute{}, "TypeMeta", "ObjectMeta", "Status"),
+	cmpopts.IgnoreFields(gwapiv1.BackendRef{}, "Weight"),
+	cmpopts.IgnoreFields(gwapiv1.BackendObjectReference{}, "Group", "Kind", "Namespace"),
+	cmpopts.IgnoreFields(gwapiv1.ParentReference{}, "Group", "Kind"),
 }
 
 func getNameFromEnvFrom(source corev1.EnvFromSource) string {

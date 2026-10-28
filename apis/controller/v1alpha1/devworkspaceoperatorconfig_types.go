@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -21,6 +21,7 @@ import (
 	dw "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -108,15 +109,34 @@ type BackupCronJobConfig struct {
 	OrasConfig *OrasConfig `json:"oras,omitempty"`
 	// Schedule specifies the cron schedule for the backup cron job.
 	// For example, "0 1 * * *" runs daily at 1 AM.
-	// +kubebuilder:default:="0 1 * * *"
+	// +kubebuilder:default:="0 0 1 * *"
 	// +kubebuilder:validation:Optional
 	Schedule string `json:"schedule,omitempty"`
 	// BackoffLimit specifies the number of retries before marking a backup job as failed.
-	// Defaults to 3 if not specified.
+	// Defaults to 1 if not specified.
 	// +kubebuilder:validation:Minimum=0
-	// +kubebuilder:default:=3
+	// +kubebuilder:default:=1
 	// +kubebuilder:validation:Optional
 	BackoffLimit *int32 `json:"backoffLimit,omitempty"`
+}
+
+// GatewayReference defines a reference to a Gateway API Gateway resource
+// that HTTPRoutes should attach to via parentRefs.
+type GatewayReference struct {
+	// Name is the name of the Gateway resource
+	// +kubebuilder:validation:Required
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=253
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?(\.[a-z0-9]([-a-z0-9]*[a-z0-9])?)*$`
+	Name string `json:"name"`
+	// Namespace is the namespace of the Gateway resource.
+	// If not specified, HTTPRoutes will reference a Gateway in the same namespace
+	// as the DevWorkspace.
+	// +kubebuilder:validation:Optional
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=63
+	// +kubebuilder:validation:Pattern=`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`
+	Namespace *string `json:"namespace,omitempty"`
 }
 
 type RoutingConfig struct {
@@ -144,6 +164,30 @@ type RoutingConfig struct {
 	// TLSCertificateConfigmapRef defines the name and namespace of the configmap with a certificate to inject into the
 	// HTTP client.
 	TLSCertificateConfigmapRef *ConfigmapReference `json:"tlsCertificateConfigmapRef,omitempty"`
+	// GatewayRef defines a reference to a Gateway API Gateway resource that HTTPRoutes
+	// should attach to when using the 'gateway-api' routing class. This field is required
+	// when routingClass is set to 'gateway-api'. The referenced Gateway must be provisioned
+	// by the cluster administrator before workspaces can use Gateway API routing.
+	// +kubebuilder:validation:Optional
+	GatewayRef *GatewayReference `json:"gatewayRef,omitempty"`
+}
+
+// OverrideConfig defines configuration options for controlling which fields are restricted
+// in `container-overrides` and `pod-overrides` DevWorkspace attributes.
+// Entries support value-level restrictions: "fieldName" restricts the field entirely,
+// while "fieldName=value" restricts only that specific value (other values remain allowed).
+type OverrideConfig struct {
+	// RestrictedContainerOverrideFields defines a list of container-level fields that are restricted
+	// in `container-overrides` attributes. Note that the following fields are always implicitly
+	// restricted and cannot be permitted: `name`, `image`, `command`, `args`, `ports`, `env`.
+	// +kubebuilder:validation:Optional
+	RestrictedContainerOverrideFields []string `json:"restrictedContainerOverrideFields,omitempty"`
+
+	// RestrictedPodOverrideFields defines a list of pod-level fields that are restricted
+	// in `pod-overrides` attributes. Note that the following fields are always implicitly
+	// restricted and cannot be permitted: `containers`, `initContainers`.
+	// +kubebuilder:validation:Optional
+	RestrictedPodOverrideFields []string `json:"restrictedPodOverrideFields,omitempty"`
 }
 
 type WorkspaceConfig struct {
@@ -230,7 +274,7 @@ type WorkspaceConfig struct {
 	SchedulerName string `json:"schedulerName,omitempty"`
 	// DefaultContainerResources defines the resource requirements (memory/cpu limit/request) used for
 	// container components that do not define limits or requests. In order to not set a field by default,
-	// the value "0" should be used. By default, the memory limit is 128Mi and the memory request is 64Mi.
+	// the value "0" should be used. By default, the memory limit is 256Mi and the memory request is 128Mi.
 	// No CPU limit or request is added by default.
 	DefaultContainerResources *corev1.ResourceRequirements `json:"defaultContainerResources,omitempty"`
 	// ContainerResourceCaps defines the maximum resource requirements enforced for workspace
@@ -264,6 +308,12 @@ type WorkspaceConfig struct {
 	// InitContainers defines a list of Kubernetes init containers that are automatically injected into all workspace pods.
 	// Typical uses cases include injecting organization tools/configs, initializing persistent home, etc.
 	InitContainers []corev1.Container `json:"initContainers,omitempty"`
+	// Overrides defines configuration options for `container-overrides` and
+	// `pod-overrides` DevWorkspace attributes.
+	Overrides *OverrideConfig `json:"overrides,omitempty"`
+	// NetworkPolicy defines configuration options for the NetworkPolicy provisioned
+	// for each DevWorkspace.
+	NetworkPolicy *NetworkPolicyConfig `json:"networkPolicy,omitempty"`
 }
 
 type WebhookConfig struct {
@@ -297,6 +347,43 @@ type PersistentHomeConfig struct {
 	// This field is not used if the `workspace.persistUserHome.enabled` field is set to false.
 	// Enabled by default.
 	DisableInitContainer *bool `json:"disableInitContainer,omitempty"`
+}
+
+// NetworkPolicyConfig defines the NetworkPolicy the DevWorkspace Operator provisions for
+// DevWorkspaces. One NetworkPolicy is created per DevWorkspace and applies to that
+// workspace's pods only. The policy is owned by its DevWorkspace and is removed along
+// with it.
+//
+// The name, labels, podSelector and policyTypes of the NetworkPolicy are controlled by
+// the DevWorkspace Operator; only the ingress and egress rules are configurable.
+type NetworkPolicyConfig struct {
+	// Enabled determines whether a NetworkPolicy is provisioned for each DevWorkspace.
+	// Disabled by default. Changing this field does not immediately affect existing
+	// DevWorkspaces: changing the DevWorkspaceOperatorConfig does not enqueue the
+	// DevWorkspaces it affects, so the new value is applied to a DevWorkspace the next
+	// time that DevWorkspace is reconciled for any reason. Restarting a workspace is not
+	// required. Both enabling and disabling apply to running and stopped DevWorkspaces
+	// alike.
+	Enabled *bool `json:"enabled,omitempty"`
+	// Ingress defines the ingress rules applied to DevWorkspace pods. If this field is not
+	// specified, the default ingress rules of the DevWorkspace Operator apply. On OpenShift,
+	// the defaults allow traffic from the operator's own namespace and from the OpenShift
+	// monitoring, ingress, and host-network namespaces, and deny all other ingress traffic.
+	// On Kubernetes, the default allows all ingress traffic, since the namespace of the
+	// cluster's ingress controller is not known to the operator; administrators are expected
+	// to replace this with rules appropriate to their cluster.
+	// If this field is specified as an empty list, all ingress traffic to DevWorkspace pods
+	// is denied. If this field is specified as a non-empty list, exactly those rules apply
+	// and the default rules no longer apply.
+	// +kubebuilder:validation:Optional
+	Ingress []networkingv1.NetworkPolicyIngressRule `json:"ingress"`
+	// Egress defines the egress rules applied to DevWorkspace pods. If this field is not
+	// specified, the default egress rule of the DevWorkspace Operator applies, which allows
+	// all egress traffic. If this field is specified as an empty list, all egress traffic
+	// from DevWorkspace pods is denied. If this field is specified as a non-empty list,
+	// exactly those rules apply and the default rule no longer applies.
+	// +kubebuilder:validation:Optional
+	Egress []networkingv1.NetworkPolicyEgressRule `json:"egress"`
 }
 
 type Proxy struct {
@@ -376,6 +463,7 @@ type ProjectCloneConfig struct {
 	Image string `json:"image,omitempty"`
 	// ImagePullPolicy configures the imagePullPolicy for the project clone container.
 	// If undefined, the general setting .config.workspace.imagePullPolicy is used instead.
+	// If neither is set, defaults to IfNotPresent.
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 	// Resources defines the resource (cpu, memory) limits and requests for the project
 	// clone container. To explicitly not specify a limit or request, define the resource
@@ -387,7 +475,7 @@ type ProjectCloneConfig struct {
 
 type RestoreConfig struct {
 	// ImagePullPolicy configures the imagePullPolicy for the restore container.
-	// If undefined, the general setting .config.workspace.imagePullPolicy is used instead.
+	// If undefined, defaults to IfNotPresent.
 	ImagePullPolicy corev1.PullPolicy `json:"imagePullPolicy,omitempty"`
 	// Resources defines the resource (cpu, memory) limits and requests for the restore
 	// container. To explicitly not specify a limit or request, define the resource

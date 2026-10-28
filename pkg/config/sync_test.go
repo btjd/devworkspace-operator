@@ -28,10 +28,12 @@ import (
 	"github.com/stretchr/testify/assert"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/intstr"
 	"k8s.io/utils/pointer"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -99,6 +101,7 @@ func TestMergesAllFieldsFromClusterConfig(t *testing.T) {
 		func(_ *dw.DevWorkspaceTemplateSpecContent, c fuzz.Continue) {},
 		// Ensure no empty strings are generated as they cause default values to be used
 		func(s *string, c fuzz.Continue) { *s = "a" + c.RandString() },
+		func(p *corev1.PullPolicy, c fuzz.Continue) { *p = corev1.PullPolicy("a" + c.RandString()) },
 		// The only valid deployment strategies are Recreate and RollingUpdate
 		func(deploymentStrategy *appsv1.DeploymentStrategyType, c fuzz.Continue) {
 			if c.Int()%2 == 0 {
@@ -110,6 +113,7 @@ func TestMergesAllFieldsFromClusterConfig(t *testing.T) {
 		fuzzQuantity,
 		fuzzResourceList,
 		fuzzResourceRequirements,
+		fuzzIntOrString,
 	)
 	for i := 0; i < 100; i++ {
 		fuzzedConfig := &v1alpha1.OperatorConfiguration{}
@@ -433,6 +437,7 @@ func TestMergeConfigLooksAtAllFields(t *testing.T) {
 		fuzzResourceList,
 		fuzzResourceRequirements,
 		fuzzStringPtr,
+		fuzzIntOrString,
 	)
 	expectedConfig := &v1alpha1.OperatorConfiguration{}
 	actualConfig := &v1alpha1.OperatorConfiguration{}
@@ -611,6 +616,71 @@ func TestMergeConfigMergesRuntimeClassName(t *testing.T) {
 	}
 }
 
+func TestResolveConfigForWorkspaceWithNetworkPolicy(t *testing.T) {
+	setupForTest(t)
+
+	workspace := &dw.DevWorkspace{
+		Spec: dw.DevWorkspaceSpec{
+			Template: dw.DevWorkspaceTemplateSpec{
+				DevWorkspaceTemplateSpecContent: dw.DevWorkspaceTemplateSpecContent{
+					Attributes: attributes.Attributes{},
+				},
+			},
+		},
+	}
+
+	attrs := workspace.Spec.Template.DevWorkspaceTemplateSpecContent.Attributes
+	attrs.Put(
+		constants.ExternalDevWorkspaceConfiguration,
+		types.NamespacedName{
+			Name:      externalConfigName,
+			Namespace: externalConfigNamespace,
+		},
+		nil,
+	)
+
+	t.Run("external config overrides NetworkPolicy with empty ingress and egress (deny all)", func(t *testing.T) {
+		externalDwoc := &v1alpha1.DevWorkspaceOperatorConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      externalConfigName,
+				Namespace: externalConfigNamespace,
+			},
+			Config: &v1alpha1.OperatorConfiguration{
+				Workspace: &v1alpha1.WorkspaceConfig{
+					NetworkPolicy: &v1alpha1.NetworkPolicyConfig{
+						Enabled: pointer.Bool(true),
+						Ingress: []networkingv1.NetworkPolicyIngressRule{},
+						Egress:  []networkingv1.NetworkPolicyEgressRule{},
+					},
+				},
+			},
+		}
+
+		dwoc := &v1alpha1.DevWorkspaceOperatorConfig{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      OperatorConfigName,
+				Namespace: configNamespace,
+			},
+			Config: defaultConfig.DeepCopy(),
+		}
+
+		client := fake.NewClientBuilder().WithScheme(scheme).WithObjects(dwoc, externalDwoc).Build()
+		err := SetupControllerConfig(client)
+		assert.NoError(t, err)
+
+		resolvedConfig, err := ResolveConfigForWorkspace(workspace, client)
+		assert.NoError(t, err)
+		assert.NotNil(t, resolvedConfig.Workspace.NetworkPolicy)
+		assert.Equal(t, pointer.Bool(true), resolvedConfig.Workspace.NetworkPolicy.Enabled)
+
+		assert.NotNil(t, resolvedConfig.Workspace.NetworkPolicy.Ingress)
+		assert.Empty(t, resolvedConfig.Workspace.NetworkPolicy.Ingress)
+
+		assert.NotNil(t, resolvedConfig.Workspace.NetworkPolicy.Egress)
+		assert.Empty(t, resolvedConfig.Workspace.NetworkPolicy.Egress)
+	})
+}
+
 func fuzzQuantity(q *resource.Quantity, c fuzz.Continue) {
 	q.Set(c.Int63n(999))
 	q.Format = resource.DecimalSI
@@ -634,6 +704,13 @@ func fuzzResourceRequirements(req *corev1.ResourceRequirements, c fuzz.Continue)
 	c.Fuzz(&requests)
 	req.Limits = limits
 	req.Requests = requests
+}
+
+// fuzzIntOrString generates a port that can survive a round trip through the API server.
+// Fuzzing the struct directly picks a random value for the Type discriminator, and any
+// value other than Int or String makes marshalling fail with "impossible IntOrString.Type".
+func fuzzIntOrString(port *intstr.IntOrString, c fuzz.Continue) {
+	*port = intstr.FromInt32(c.Int31n(65535) + 1)
 }
 
 func fuzzStringPtr(str **string, c fuzz.Continue) {

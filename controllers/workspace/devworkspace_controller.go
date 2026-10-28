@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,9 +22,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/devfile/devworkspace-operator/pkg/library/initcontainers"
-	"github.com/devfile/devworkspace-operator/pkg/library/ssh"
-
 	dw "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	devfilevalidation "github.com/devfile/api/v2/pkg/validation"
 	controllerv1alpha1 "github.com/devfile/devworkspace-operator/apis/controller/v1alpha1"
@@ -34,27 +31,33 @@ import (
 	wkspConfig "github.com/devfile/devworkspace-operator/pkg/config"
 	"github.com/devfile/devworkspace-operator/pkg/constants"
 	"github.com/devfile/devworkspace-operator/pkg/dwerrors"
+	"github.com/devfile/devworkspace-operator/pkg/httpfactory"
 	"github.com/devfile/devworkspace-operator/pkg/library/annotate"
 	containerlib "github.com/devfile/devworkspace-operator/pkg/library/container"
 	wsDefaults "github.com/devfile/devworkspace-operator/pkg/library/defaults"
 	"github.com/devfile/devworkspace-operator/pkg/library/env"
 	"github.com/devfile/devworkspace-operator/pkg/library/flatten"
 	"github.com/devfile/devworkspace-operator/pkg/library/home"
+	"github.com/devfile/devworkspace-operator/pkg/library/initcontainers"
 	kubesync "github.com/devfile/devworkspace-operator/pkg/library/kubernetes"
+	"github.com/devfile/devworkspace-operator/pkg/library/overrides/restrictions"
 	"github.com/devfile/devworkspace-operator/pkg/library/projects"
 	"github.com/devfile/devworkspace-operator/pkg/library/restore"
+	"github.com/devfile/devworkspace-operator/pkg/library/ssh"
 	"github.com/devfile/devworkspace-operator/pkg/library/status"
 	"github.com/devfile/devworkspace-operator/pkg/provision/automount"
 	"github.com/devfile/devworkspace-operator/pkg/provision/metadata"
 	"github.com/devfile/devworkspace-operator/pkg/provision/storage"
 	"github.com/devfile/devworkspace-operator/pkg/provision/sync"
 	wsprovision "github.com/devfile/devworkspace-operator/pkg/provision/workspace"
+	"github.com/devfile/devworkspace-operator/pkg/provision/workspace/networkpolicy"
 	"github.com/devfile/devworkspace-operator/pkg/provision/workspace/rbac"
 	"github.com/go-logr/logr"
 	"github.com/google/uuid"
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	networkingv1 "k8s.io/api/networking/v1"
 	k8sErrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -90,11 +93,14 @@ type DevWorkspaceReconciler struct {
 // +kubebuilder:rbac:groups="",resources=pods;serviceaccounts;secrets;configmaps;persistentvolumeclaims,verbs=*
 // +kubebuilder:rbac:groups="",resources=namespaces;events,verbs=get;list;watch
 // +kubebuilder:rbac:groups="batch",resources=jobs,verbs=get;create;list;watch;update;patch;delete
+// +kubebuilder:rbac:groups=networking.k8s.io,resources=networkpolicies,verbs=create;delete;update;patch;get;list;watch
 // +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=mutatingwebhookconfigurations;validatingwebhookconfigurations,verbs=get;list;watch;create;update;patch;delete
 // +kubebuilder:rbac:groups=authorization.k8s.io,resources=subjectaccessreviews;localsubjectaccessreviews,verbs=create
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=clusterroles;clusterrolebindings,verbs=get;list;watch;create;update
 // +kubebuilder:rbac:groups=rbac.authorization.k8s.io,resources=roles;rolebindings,verbs=get;list;watch;create;update;delete
 // +kubebuilder:rbac:groups=oauth.openshift.io,resources=oauthclients,verbs=get;list;watch;create;update;patch;delete;deletecollection
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=get,resourceNames=cluster
+// +kubebuilder:rbac:groups=config.openshift.io,resources=apiservers,verbs=list;watch
 // +kubebuilder:rbac:groups=monitoring.coreos.com,resources=servicemonitors,verbs=get;create
 // +kubebuilder:rbac:groups=config.openshift.io,resources=proxies,verbs=get,resourceNames=cluster
 // +kubebuilder:rbac:groups=apps,resourceNames=devworkspace-controller,resources=deployments/finalizers,verbs=update
@@ -144,9 +150,6 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	reqLogger = reqLogger.WithValues(constants.DevWorkspaceIDLoggerKey, workspace.Status.DevWorkspaceId)
 	reqLogger.Info("Reconciling Workspace", "resolvedConfig", configString)
 
-	// Inject ca certificates to the http client, if the certificates configmap is created and defined in the config.
-	InjectCertificates(r.Client, r.Log)
-
 	// Check if the DevWorkspaceRouting instance is marked to be deleted, which is
 	// indicated by the deletion timestamp being set.
 	if workspace.GetDeletionTimestamp() != nil {
@@ -165,6 +168,13 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		workspace.Status.DevWorkspaceId = workspaceId
 		err = r.Status().Update(ctx, workspace.DevWorkspace)
 		return reconcile.Result{Requeue: true}, err
+	}
+
+	// Sync the NetworkPolicy early, so that it follows the operator configuration for every
+	// workspace and not just the starting ones, and exists before any workspace pod does.
+	err = networkpolicy.SyncNetworkPolicy(workspace, clusterAPI)
+	if shouldReturn, reconcileResult, reconcileErr := r.checkDWError(workspace, err, "Error provisioning network policy", metrics.ReasonInfrastructureFailure, reqLogger, &reconcileStatus); shouldReturn {
+		return reconcileResult, reconcileErr
 	}
 
 	// Stop failed workspaces
@@ -260,6 +270,8 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return reconcile.Result{Requeue: true}, err
 	}
 
+	httpClient := httpfactory.HttpFactory.GetHttpClient(ctx, config.Routing)
+
 	flattenHelpers := flatten.ResolverTools{
 		WorkspaceNamespace:          workspace.Namespace,
 		Context:                     ctx,
@@ -339,6 +351,7 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		workspace.Config.Workspace.DefaultContainerResources,
 		workspace.Config.Workspace.ContainerResourceCaps,
 		workspace.Config.Workspace.PostStartTimeout,
+		restrictions.GetRestrictedContainerFields(workspace),
 		postStartDebugTrapSleepDuration,
 	)
 	if err != nil {
@@ -360,8 +373,8 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			Env:       env.GetEnvironmentVariablesForProjectRestore(workspace),
 			Resources: workspace.Config.Workspace.RestoreConfig.Resources,
 		}
-		if config.Workspace.ImagePullPolicy != "" {
-			restoreOptions.PullPolicy = corev1.PullPolicy(config.Workspace.ImagePullPolicy)
+		if workspace.Config.Workspace.RestoreConfig.ImagePullPolicy != "" {
+			restoreOptions.PullPolicy = workspace.Config.Workspace.RestoreConfig.ImagePullPolicy
 		} else {
 			restoreOptions.PullPolicy = corev1.PullIfNotPresent
 		}
@@ -432,12 +445,15 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 			return r.failWorkspace(workspace, fmt.Sprintf("Failed to merge init containers: %s", err), metrics.ReasonBadRequest, reqLogger, &reconcileStatus), nil
 		}
 
-		// Ensure init-persistent-home container has correct fields after merge
+		// Post-merge fixups on init containers
 		for i := range merged {
 			if merged[i].Name == constants.HomeInitComponentName {
 				if err := home.EnsureHomeInitContainerFields(&merged[i]); err != nil {
 					return r.failWorkspace(workspace, fmt.Sprintf("Failed to configure %s container: %s", constants.HomeInitComponentName, err), metrics.ReasonBadRequest, reqLogger, &reconcileStatus), nil
 				}
+			}
+			if merged[i].ImagePullPolicy == "" {
+				merged[i].ImagePullPolicy = corev1.PullIfNotPresent
 			}
 		}
 
@@ -454,8 +470,18 @@ func (r *DevWorkspaceReconciler) Reconcile(ctx context.Context, req ctrl.Request
 		return r.failWorkspace(workspace, fmt.Sprintf("Failed to mount SSH askpass script to workspace: %s", err), metrics.ReasonWorkspaceEngineFailure, reqLogger, &reconcileStatus), nil
 	}
 
-	// Add automount resources into devfile containers
-	err = automount.ProvisionAutoMountResourcesInto(devfilePodAdditions, clusterAPI, workspace.Namespace, home.PersistUserHomeEnabled(workspace))
+	var workspaceDeployment *appsv1.Deployment
+
+	if workspace.Status.Phase == dw.DevWorkspaceStatusRunning {
+		// Fetch the existing deployment to determine whether automount resources with
+		// `controller.devfile.io/mount-on-start=true` can be mounted without a restart.
+		// Only needed when the workspace is already running; skip otherwise to reduce API calls.
+		if workspaceDeployment, err = wsprovision.GetClusterDeployment(workspace, clusterAPI); err != nil {
+			return reconcile.Result{}, err
+		}
+	}
+
+	err = automount.ProvisionAutoMountResourcesInto(devfilePodAdditions, clusterAPI, workspace.Namespace, workspace.Name, home.PersistUserHomeEnabled(workspace), workspaceDeployment)
 	if shouldReturn, reconcileResult, reconcileErr := r.checkDWError(workspace, err, "Failed to process automount resources", metrics.ReasonBadRequest, reqLogger, &reconcileStatus); shouldReturn {
 		return reconcileResult, reconcileErr
 	}
@@ -778,8 +804,6 @@ func (r *DevWorkspaceReconciler) getWorkspaceId(ctx context.Context, workspace *
 }
 
 func (r *DevWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
-	setupHttpClients(mgr.GetClient(), mgr.GetLogger())
-
 	maxConcurrentReconciles, err := wkspConfig.GetMaxConcurrentReconciles()
 	if err != nil {
 		return err
@@ -794,7 +818,10 @@ func (r *DevWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 
 	// TODO: Set up indexing https://book.kubebuilder.io/cronjob-tutorial/controller-implementation.html#setup
 	return ctrl.NewControllerManagedBy(mgr).
-		WithOptions(controller.Options{MaxConcurrentReconciles: maxConcurrentReconciles}).
+		WithOptions(controller.Options{
+			MaxConcurrentReconciles: maxConcurrentReconciles,
+			UsePriorityQueue:        pointer.Bool(false),
+		}).
 		For(&dw.DevWorkspace{}).
 		// List DevWorkspaceTemplates as owned to enable updating workspaces when templates
 		// are changed; this should be moved to whichever controller is responsible for flattening
@@ -806,6 +833,7 @@ func (r *DevWorkspaceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&corev1.ConfigMap{}).
 		Owns(&corev1.Secret{}).
 		Owns(&corev1.ServiceAccount{}).
+		Owns(&networkingv1.NetworkPolicy{}).
 		Watches(&corev1.Pod{}, handler.EnqueueRequestsFromMapFunc(dwRelatedPodsHandler)).
 		Watches(&corev1.PersistentVolumeClaim{}, handler.EnqueueRequestsFromMapFunc(r.dwPVCHandler)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.runningWorkspacesHandler), automountWatcher).

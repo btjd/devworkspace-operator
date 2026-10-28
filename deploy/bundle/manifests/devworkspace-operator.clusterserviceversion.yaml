@@ -10,7 +10,7 @@ metadata:
   labels:
     operatorframework.io/arch.amd64: supported
     operatorframework.io/arch.arm64: supported
-  name: devworkspace-operator.v0.40.0-dev
+  name: devworkspace-operator.v1.1.0-dev
 spec:
   apiservicedefinitions: {}
   customresourcedefinitions:
@@ -217,9 +217,17 @@ spec:
           - watch
         - apiGroups:
           - config.openshift.io
+          resources:
+          - apiservers
+          verbs:
+          - list
+          - watch
+        - apiGroups:
+          - config.openshift.io
           resourceNames:
           - cluster
           resources:
+          - apiservers
           - proxies
           verbs:
           - get
@@ -257,6 +265,18 @@ spec:
           - get
           - update
         - apiGroups:
+          - gateway.networking.k8s.io
+          resources:
+          - httproutes
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
+        - apiGroups:
           - image.openshift.io
           resources:
           - imagestreams
@@ -288,6 +308,18 @@ spec:
           - ingresses
           verbs:
           - '*'
+        - apiGroups:
+          - networking.k8s.io
+          resources:
+          - networkpolicies
+          verbs:
+          - create
+          - delete
+          - get
+          - list
+          - patch
+          - update
+          - watch
         - apiGroups:
           - oauth.openshift.io
           resources:
@@ -534,7 +566,7 @@ spec:
     name: async_storage_server
   - image: quay.io/eclipse/che-sidecar-workspace-data-sync:0.0.1
     name: async_storage_sidecar
-  version: 0.40.0-dev
+  version: 1.1.0-dev
   webhookdefinitions:
   - admissionReviewVersions:
     - v1

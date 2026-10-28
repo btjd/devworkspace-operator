@@ -1,4 +1,4 @@
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -22,12 +22,12 @@ import (
 
 	dw "github.com/devfile/api/v2/pkg/apis/workspaces/v1alpha2"
 	controllerv1alpha1 "github.com/devfile/devworkspace-operator/apis/controller/v1alpha1"
-	workspacecontroller "github.com/devfile/devworkspace-operator/controllers/workspace"
 	"github.com/devfile/devworkspace-operator/controllers/workspace/internal/testutil"
 	"github.com/devfile/devworkspace-operator/pkg/common"
 	"github.com/devfile/devworkspace-operator/pkg/conditions"
 	"github.com/devfile/devworkspace-operator/pkg/config"
 	"github.com/devfile/devworkspace-operator/pkg/constants"
+	"github.com/devfile/devworkspace-operator/pkg/httpfactory"
 	"github.com/devfile/devworkspace-operator/pkg/library/projects"
 	"github.com/devfile/devworkspace-operator/pkg/library/restore"
 	. "github.com/onsi/ginkgo/v2"
@@ -184,7 +184,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		AfterEach(func() {
 			deleteDevWorkspace(devWorkspaceName)
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Creates roles and rolebindings", func() {
@@ -317,7 +317,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 			devworkspace := getExistingDevWorkspace(devWorkspaceName)
 			workspaceID := devworkspace.Status.DevWorkspaceId
 
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						"test-url/healthz": {
@@ -355,7 +355,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 		const testURL = "test-url"
 
 		BeforeEach(func() {
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						fmt.Sprintf("%s/healthz", testURL): {
@@ -368,7 +368,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		AfterEach(func() {
 			deleteDevWorkspace(devWorkspaceName)
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Mounts image pull secrets to the DevWorkspace Deployment", func() {
@@ -876,13 +876,85 @@ var _ = Describe("DevWorkspace Controller", func() {
 				return fmt.Errorf("Secret not found in volumes")
 			}, 1*time.Second, interval).Should(Succeed(), "Merged credentials secret is added to deployment")
 		})
+
+		It("Removes mount-on-start volume from deployment when secret is deleted and does not remount recreated secret", func() {
+			By("Creating a mount-on-start automount secret")
+			secret := generateSecret("mount-on-start-secret", corev1.SecretTypeOpaque)
+			secret.Labels[constants.DevWorkspaceMountLabel] = "true"
+			secret.Annotations[constants.DevWorkspaceMountPathAnnotation] = "/test/mount"
+			secret.Annotations[constants.MountOnStartAttribute] = "true"
+			secret.Data["data"] = []byte("original-content")
+			createObject(secret)
+
+			By("Creating and starting workspace")
+			createStartedDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			expectedVolumeName := common.AutoMountSecretVolumeName("mount-on-start-secret")
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+
+			By("Checking that mount-on-start secret volume is in the deployment")
+			Eventually(func() error {
+				deploy := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, deployNN, deploy); err != nil {
+					return err
+				}
+				for _, volume := range deploy.Spec.Template.Spec.Volumes {
+					if volume.Name == expectedVolumeName {
+						return nil
+					}
+				}
+				return fmt.Errorf("volume %s not found in deployment", expectedVolumeName)
+			}, timeout, interval).Should(Succeed(), "Mount-on-start secret should be mounted in deployment")
+
+			By("Deleting the original secret")
+			deleteObject(secret)
+
+			By("Checking that volume is removed from deployment after secret deletion (triggers workspace restart)")
+			Eventually(func() bool {
+				deploy := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, deployNN, deploy); err != nil {
+					return false
+				}
+				for _, volume := range deploy.Spec.Template.Spec.Volumes {
+					if volume.Name == expectedVolumeName {
+						return false
+					}
+				}
+				return true
+			}, 30*time.Second, interval).Should(BeTrue(), "Volume should be removed from deployment after secret deletion")
+
+			By("Creating a new secret with the same name but different data")
+			newSecret := generateSecret("mount-on-start-secret", corev1.SecretTypeOpaque)
+			newSecret.Labels[constants.DevWorkspaceMountLabel] = "true"
+			newSecret.Annotations[constants.DevWorkspaceMountPathAnnotation] = "/test/mount"
+			newSecret.Annotations[constants.MountOnStartAttribute] = "true"
+			newSecret.Data["data"] = []byte("new-content")
+			createObject(newSecret)
+			defer deleteObject(newSecret)
+
+			By("Checking that the recreated mount-on-start secret is NOT mounted while workspace is already running")
+			Consistently(func() bool {
+				deploy := &appsv1.Deployment{}
+				if err := k8sClient.Get(ctx, deployNN, deploy); err != nil {
+					return false
+				}
+				for _, volume := range deploy.Spec.Template.Spec.Volumes {
+					if volume.Name == expectedVolumeName {
+						return false
+					}
+				}
+				return true
+			}, 2*time.Second, interval).Should(BeTrue(), "Recreated mount-on-start secret should NOT be mounted while workspace is already running")
+		})
 	})
 
 	Context("DevWorkspace deployment", func() {
 		const testURL = "test-url"
 
 		BeforeEach(func() {
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						fmt.Sprintf("%s/healthz", testURL): {
@@ -895,7 +967,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		AfterEach(func() {
 			deleteDevWorkspace(devWorkspaceName)
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Sets the runtimeClassName from the DWOC", func() {
@@ -961,7 +1033,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 		const testURL = "test-url"
 
 		BeforeEach(func() {
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						fmt.Sprintf("%s/healthz", testURL): {
@@ -975,7 +1047,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		AfterEach(func() {
 			deleteDevWorkspace(devWorkspaceName)
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Stops workspaces and scales deployment to zero", func() {
@@ -1152,7 +1224,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		BeforeEach(func() {
 			By("Setting up HTTP client")
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						fmt.Sprintf("%s/healthz", testURL): {
@@ -1169,7 +1241,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 			deleteDevWorkspace(altDevWorkspaceName)
 			cleanupPVC("claim-devworkspace")
 			By("Resetting HTTP client")
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Cleans up workspace PVC storage when other workspaces exist", func() {
@@ -1289,7 +1361,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 		const testURL = "test-url"
 
 		BeforeEach(func() {
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						fmt.Sprintf("%s/healthz", testURL): {
@@ -1302,7 +1374,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 		AfterEach(func() {
 			deleteDevWorkspace(devWorkspaceName)
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Restores workspace from backup with common PVC", func() {
@@ -1483,6 +1555,222 @@ var _ = Describe("DevWorkspace Controller", func() {
 
 	})
 
+	Context("Init container imagePullPolicy", func() {
+		const testURL = "test-url"
+
+		BeforeEach(func() {
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
+				Transport: &testutil.TestRoundTripper{
+					Data: map[string]testutil.TestResponse{
+						fmt.Sprintf("%s/healthz", testURL): {
+							StatusCode: http.StatusOK,
+						},
+					},
+				},
+			})
+		})
+
+		AfterEach(func() {
+			deleteDevWorkspace(devWorkspaceName)
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
+		})
+
+		It("Defaults project-clone imagePullPolicy to IfNotPresent", func() {
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var projectClone *corev1.Container
+			for i := range deploy.Spec.Template.Spec.InitContainers {
+				if deploy.Spec.Template.Spec.InitContainers[i].Name == projects.ProjectClonerContainerName {
+					projectClone = &deploy.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(projectClone).NotTo(BeNil(), "project-clone init container should be present")
+			Expect(projectClone.ImagePullPolicy).To(Equal(corev1.PullIfNotPresent), "project-clone should default to IfNotPresent")
+		})
+
+		It("Uses DWOC override for project-clone imagePullPolicy", func() {
+			config.SetGlobalConfigForTesting(&controllerv1alpha1.OperatorConfiguration{
+				Workspace: &controllerv1alpha1.WorkspaceConfig{
+					ProjectCloneConfig: &controllerv1alpha1.ProjectCloneConfig{
+						ImagePullPolicy: corev1.PullAlways,
+					},
+				},
+			})
+			defer config.SetGlobalConfigForTesting(nil)
+
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var projectClone *corev1.Container
+			for i := range deploy.Spec.Template.Spec.InitContainers {
+				if deploy.Spec.Template.Spec.InitContainers[i].Name == projects.ProjectClonerContainerName {
+					projectClone = &deploy.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(projectClone).NotTo(BeNil(), "project-clone init container should be present")
+			Expect(projectClone.ImagePullPolicy).To(Equal(corev1.PullAlways), "project-clone should use DWOC override")
+		})
+
+		It("Defaults DWOC init container imagePullPolicy to IfNotPresent", func() {
+			config.SetGlobalConfigForTesting(&controllerv1alpha1.OperatorConfiguration{
+				Workspace: &controllerv1alpha1.WorkspaceConfig{
+					InitContainers: []corev1.Container{
+						{
+							Name:    "test-init",
+							Image:   "busybox:latest",
+							Command: []string{"sh", "-c", "echo hello"},
+						},
+					},
+				},
+			})
+			defer config.SetGlobalConfigForTesting(nil)
+
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var testInit *corev1.Container
+			for i := range deploy.Spec.Template.Spec.InitContainers {
+				if deploy.Spec.Template.Spec.InitContainers[i].Name == "test-init" {
+					testInit = &deploy.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(testInit).NotTo(BeNil(), "test-init container should be present")
+			Expect(testInit.ImagePullPolicy).To(Equal(corev1.PullIfNotPresent), "DWOC init container should default to IfNotPresent")
+		})
+
+		It("Preserves explicit imagePullPolicy on DWOC init containers", func() {
+			config.SetGlobalConfigForTesting(&controllerv1alpha1.OperatorConfiguration{
+				Workspace: &controllerv1alpha1.WorkspaceConfig{
+					InitContainers: []corev1.Container{
+						{
+							Name:            "test-init",
+							Image:           "busybox:latest",
+							Command:         []string{"sh", "-c", "echo hello"},
+							ImagePullPolicy: corev1.PullAlways,
+						},
+					},
+				},
+			})
+			defer config.SetGlobalConfigForTesting(nil)
+
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var testInit *corev1.Container
+			for i := range deploy.Spec.Template.Spec.InitContainers {
+				if deploy.Spec.Template.Spec.InitContainers[i].Name == "test-init" {
+					testInit = &deploy.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(testInit).NotTo(BeNil(), "test-init container should be present")
+			Expect(testInit.ImagePullPolicy).To(Equal(corev1.PullAlways), "Explicit imagePullPolicy should be preserved")
+		})
+
+		It("Does not override base imagePullPolicy when DWOC init container has no explicit policy", func() {
+			config.SetGlobalConfigForTesting(&controllerv1alpha1.OperatorConfiguration{
+				Workspace: &controllerv1alpha1.WorkspaceConfig{
+					ProjectCloneConfig: &controllerv1alpha1.ProjectCloneConfig{
+						ImagePullPolicy: corev1.PullAlways,
+					},
+					InitContainers: []corev1.Container{
+						{
+							Name: projects.ProjectClonerContainerName,
+							Env:  []corev1.EnvVar{{Name: "EXTRA_VAR", Value: "injected"}},
+						},
+					},
+				},
+			})
+			defer config.SetGlobalConfigForTesting(nil)
+
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var projectClone *corev1.Container
+			for i := range deploy.Spec.Template.Spec.InitContainers {
+				if deploy.Spec.Template.Spec.InitContainers[i].Name == projects.ProjectClonerContainerName {
+					projectClone = &deploy.Spec.Template.Spec.InitContainers[i]
+				}
+			}
+			Expect(projectClone).NotTo(BeNil(), "project-clone init container should be present")
+			Expect(projectClone.ImagePullPolicy).To(Equal(corev1.PullAlways), "DWOC patch should not override base imagePullPolicy")
+		})
+
+		It("Keeps workspace container imagePullPolicy as Always", func() {
+			createDevWorkspace(devWorkspaceName, "test-devworkspace.yaml")
+			devworkspace := getExistingDevWorkspace(devWorkspaceName)
+			workspaceID := devworkspace.Status.DevWorkspaceId
+
+			By("Manually making Routing ready to continue")
+			markRoutingReady(testURL, common.DevWorkspaceRoutingName(workspaceID))
+
+			deploy := &appsv1.Deployment{}
+			deployNN := namespacedName(common.DeploymentName(workspaceID), testNamespace)
+			Eventually(func() error {
+				return k8sClient.Get(ctx, deployNN, deploy)
+			}, timeout, interval).Should(Succeed(), "Getting workspace deployment from cluster")
+
+			var devContainer *corev1.Container
+			for i := range deploy.Spec.Template.Spec.Containers {
+				if deploy.Spec.Template.Spec.Containers[i].Name == "web-terminal" {
+					devContainer = &deploy.Spec.Template.Spec.Containers[i]
+				}
+			}
+			Expect(devContainer).NotTo(BeNil(), "web-terminal container should be present")
+			Expect(devContainer.ImagePullPolicy).To(Equal(corev1.PullAlways), "Workspace containers should still default to Always")
+		})
+	})
+
 	Context("Edge cases", func() {
 
 		It("Allows Kubernetes and Container components to share same target port on endpoint", func() {
@@ -1491,7 +1779,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 			devworkspace := getExistingDevWorkspace(devWorkspaceName)
 			workspaceID := devworkspace.Status.DevWorkspaceId
 
-			workspacecontroller.SetupHttpClientsForTesting(&http.Client{
+			httpfactory.SetupHttpClientsForTesting(&http.Client{
 				Transport: &testutil.TestRoundTripper{
 					Data: map[string]testutil.TestResponse{
 						"test-url/healthz": {
@@ -1523,7 +1811,7 @@ var _ = Describe("DevWorkspace Controller", func() {
 			Expect(runningCondition.Status).Should(Equal(corev1.ConditionTrue))
 
 			// Clean up
-			workspacecontroller.SetupHttpClientsForTesting(getBasicTestHttpClient())
+			httpfactory.SetupHttpClientsForTesting(getBasicTestHttpClient())
 		})
 
 		It("Ensures preStart initContainers are run after project-clone", func() {

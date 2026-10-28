@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2019-2025 Red Hat, Inc.
+// Copyright (c) 2019-2026 Red Hat, Inc.
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -20,11 +20,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"runtime"
-	"syscall"
 
+	controllerv1alpha1 "github.com/devfile/devworkspace-operator/apis/controller/v1alpha1"
+	"github.com/devfile/devworkspace-operator/pkg/httpfactory"
+	kubesync "github.com/devfile/devworkspace-operator/pkg/library/kubernetes"
+	configv1 "github.com/openshift/api/config/v1"
+	routev1 "github.com/openshift/api/route/v1"
+	"k8s.io/utils/ptr"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/metrics/filters"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 	"sigs.k8s.io/controller-runtime/pkg/webhook"
@@ -34,6 +43,7 @@ import (
 	"github.com/devfile/devworkspace-operator/pkg/cache"
 	"github.com/devfile/devworkspace-operator/pkg/config"
 	"github.com/devfile/devworkspace-operator/pkg/infrastructure"
+	"github.com/devfile/devworkspace-operator/pkg/tlssetup"
 	"github.com/devfile/devworkspace-operator/version"
 	"github.com/devfile/devworkspace-operator/webhook/server"
 	"github.com/devfile/devworkspace-operator/webhook/workspace"
@@ -64,8 +74,14 @@ func init() {
 	}
 
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
+	utilruntime.Must(controllerv1alpha1.AddToScheme(scheme))
 	utilruntime.Must(dwv1.AddToScheme(scheme))
 	utilruntime.Must(dwv2.AddToScheme(scheme))
+
+	if infrastructure.IsOpenShift() {
+		utilruntime.Must(routev1.AddToScheme(scheme))
+		utilruntime.Must(configv1.AddToScheme(scheme))
+	}
 }
 
 func main() {
@@ -82,10 +98,22 @@ func main() {
 	log.Info(fmt.Sprintf("Commit: %s", version.Commit))
 	log.Info(fmt.Sprintf("BuildTime: %s", version.BuildTime))
 
+	if err := kubesync.InitializeDeserializer(scheme); err != nil {
+		log.Error(err, "Failed to initialize kubernetes object deserializer")
+		os.Exit(1)
+	}
+
 	// Get a config to talk to the apiserver
 	cfg, err := clientconfig.GetConfig()
 	if err != nil {
 		log.Error(err, "")
+		os.Exit(1)
+	}
+
+	serverTLS, err := tlssetup.BuildServerTLSOptions(
+		context.Background(), cfg, scheme, log)
+	if err != nil {
+		log.Error(err, "failed to build TLS options from cluster TLS profile")
 		os.Exit(1)
 	}
 
@@ -105,6 +133,7 @@ func main() {
 		CertDir: server.WebhookServerCertDir,
 		Port:    server.WebhookServerPort,
 		Host:    server.WebhookServerHost,
+		TLSOpts: serverTLS.TLSOpts,
 	})
 
 	// Create a new Cmd to provide shared dependencies and start components
@@ -114,6 +143,7 @@ func main() {
 			BindAddress:    metricsAddr,
 			FilterProvider: filters.WithAuthenticationAndAuthorization,
 			SecureServing:  true,
+			TLSOpts:        serverTLS.TLSOpts,
 		},
 		WebhookServer:          webhookServer,
 		HealthProbeBindAddress: ":6789",
@@ -124,14 +154,46 @@ func main() {
 		os.Exit(1)
 	}
 
+	nonCachedClient, err := client.New(mgr.GetConfig(), client.Options{Scheme: mgr.GetScheme()})
+	if err != nil {
+		log.Error(err, "Failed to setup nonCachedClient")
+		os.Exit(1)
+	}
+
+	err = config.SetupControllerConfig(nonCachedClient)
+	if err != nil {
+		log.Error(err, "Failed to setup Controller Config")
+		os.Exit(1)
+	}
+
+	err = httpfactory.SetupHttpClientsFactory(nonCachedClient, mgr.GetLogger())
+	if err != nil {
+		log.Error(err, "Failed to setup Http clients factory")
+		os.Exit(1)
+	}
+
+	err = setupConfigCacheWatcher(mgr)
+	if err != nil {
+		log.Error(err, "Failed to setup config watcher")
+		os.Exit(1)
+	}
+
 	err = createWebhooks(mgr)
 	if err != nil {
 		log.Error(err, "Failed to create webhooks")
 		os.Exit(1)
 	}
 
-	var shutdownChan = make(chan os.Signal, 1)
-	signal.Notify(shutdownChan, syscall.SIGTERM)
+	signalCtx := signals.SetupSignalHandler()
+	ctx, cancelCtx := context.WithCancel(signalCtx)
+	defer cancelCtx()
+
+	if infrastructure.IsOpenShift() {
+		if err := tlssetup.RegisterSecurityProfileWatcher(mgr, serverTLS, cancelCtx, log); err != nil {
+			log.Error(err, "unable to set up TLS security profile watcher")
+			os.Exit(1)
+		}
+	}
 
 	// Setup health check
 	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
@@ -146,7 +208,7 @@ func main() {
 	}
 
 	log.Info("Starting manager")
-	if err := mgr.Start(signals.SetupSignalHandler()); err != nil {
+	if err := mgr.Start(ctx); err != nil {
 		log.Error(err, "Manager exited non-zero")
 		os.Exit(1)
 	}
@@ -164,4 +226,23 @@ func createWebhooks(mgr manager.Manager) error {
 		return err
 	}
 	return nil
+}
+
+func setupConfigCacheWatcher(mgr ctrl.Manager) error {
+	emptyMapper := func(ctx context.Context, obj client.Object) []reconcile.Request {
+		return []reconcile.Request{}
+	}
+
+	// Do nothing, just for keeping DWOC up to date
+	return ctrl.NewControllerManagedBy(mgr).
+		Named("dwoc-config-watcher").
+		WithOptions(controller.Options{
+			UsePriorityQueue: ptr.To(false),
+		}).
+		Watches(&controllerv1alpha1.DevWorkspaceOperatorConfig{},
+			handler.EnqueueRequestsFromMapFunc(emptyMapper),
+			builder.WithPredicates(config.Predicates())).
+		Complete(reconcile.Func(func(ctx context.Context, req reconcile.Request) (reconcile.Result, error) {
+			return reconcile.Result{}, nil
+		}))
 }

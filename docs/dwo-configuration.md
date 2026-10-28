@@ -125,7 +125,7 @@ Backup CronJob configuration fields:
 The value provided for registry.path is only the first segment of the final location. The full registry path is assembled dynamically, incorporating the name of the workspace and the :latest tag, following this pattern:
 `<registry.path>/<devworkspace-name>:latest`
 
-- **`registry.authSecret`**: (Optional) The name of the Kubernetes Secret containing credentials to access the OCI registry. If not provided, it is assumed that the registry is public or uses integrated OpenShift registry.
+- **`registry.authSecret`**: (Optional) The name of the secret in the **operator namespace** to copy to workspace namespaces. The secret is always copied as `devworkspace-backup-registry-auth` in the workspace namespace. If not provided, backup/restore jobs proceed without authentication.
 - **`oras.extraArgs`**: (Optional) Additional arguments to pass to the `oras` CLI tool during push and pull operations.
 
 
@@ -196,17 +196,21 @@ The secret must contain a label `controller.devfile.io/watch-secret=true` to be 
 kubectl label secret my-secret controller.devfile.io/watch-secret=true -n devworkspace-controller
 ```
 
-### Restore from backup
-We are aiming to provide automated restore functionality in future releases. But for now you can still
-manually restore the data from the backup archives created by the backup job.
+### Restore workspace from backup
 
-Since the backup archive is available in OCI registry you can use any OCI compatible tool to pull
-the archive locally. For example using [oras](https://github.com/oras-project/oras) cli tool:
+DevWorkspaces can be restored from a backup by setting the `controller.devfile.io/restore-workspace: 'true'` attribute. When this attribute is set, the workspace deployment includes a restore init container that pulls the backed-up `/projects` content from an OCI registry instead of cloning from Git.
 
-```bash
-oras pull <registry-path>/<devworkspace-name>:latest
+By default, the restore source is derived from the admin-configured registry at `<registry>/<namespace>/<workspace>:latest`. Users can optionally specify a custom source image using the `controller.devfile.io/restore-source-image` attribute.
+
+```yaml
+kind: DevWorkspace
+spec:
+  template:
+    attributes:
+      controller.devfile.io/restore-workspace: 'true'
+      # Optional: restore from a specific image instead of the default backup registry
+      controller.devfile.io/restore-source-image: 'registry.example.com/my-backup:latest'
 ```
-The archive will be downloaded as a `devworkspace-backup.tar.gz` file which you can extract and restore the data.
 
 ## Configuring PVC storage access mode
 
@@ -226,6 +230,47 @@ config:
 ```
 
 The config above will have newly created PVCs to have its access mode set to `ReadWriteMany`.
+
+## Configuring Workspace NetworkPolicy
+
+By default, DevWorkspace pods accept traffic from anywhere in the cluster. 
+Administrators can enable NetworkPolicy provisioning to restrict workspace network access. 
+When enabled, the operator creates one NetworkPolicy per DevWorkspace, 
+named `<workspace-id>-networkpolicy` in the workspace's namespace. Each policy applies only 
+to the pods of its own workspace, selected by the `controller.devfile.io/devworkspace_id` label.
+
+**Rule semantics:**
+- Omitting a rule field (e.g., no `ingress` key) means the operator's default rules for that direction apply. 
+- Setting a rule field to an empty list (e.g., `ingress: []`) denies all traffic in that direction.
+- Setting `ingress` or `egress` to a non-empty list applies exactly those rules and replaces the defaults 
+entirely rather than appending to them. Any default rule that should be kept must be repeated in the configuration.
+
+**Lifecycle:**
+- A workspace's policy is synced on every reconcile of that workspace, whether it is running or stopped,
+and before any workspace pod is created.
+- Changing this configuration does not enqueue the workspaces it affects, so a new value reaches a given
+workspace on its next reconcile rather than immediately. Restarting a workspace is not required.
+- The policy is owned by its DevWorkspace, so it is garbage collected when the workspace is deleted.
+- Disabling the feature (setting `enabled: false`) removes the policies of both running and stopped workspaces,
+restoring connectivity rather than leaving stale policies in place.
+- While the feature is enabled, the policy of a stopped workspace is left in place, where it governs no pods,
+and is removed when the workspace is deleted.
+
+```yaml
+apiVersion: controller.devfile.io/v1alpha1
+kind: DevWorkspaceOperatorConfig
+metadata:
+  name: devworkspace-operator-config
+  namespace: $OPERATOR_INSTALL_NAMESPACE
+config:
+  workspace:
+    networkPolicy:
+      enabled: true
+      ingress:
+        - {}
+      egress:
+        - {}
+```
 
 ## Configuring Custom Init Containers
 
@@ -306,3 +351,94 @@ config:
 ### Execution Order
 
 Custom init containers are injected after the project-clone init container in the order they are defined in the configuration. The `init-persistent-home` container runs in this sequence along with other custom init containers.
+
+## Always-restricted override fields
+
+Regardless of configuration, certain fields are **always** rejected in overrides and
+cannot be unblocked by any configuration change.
+
+**Container overrides:** `name`, `image`, `command`, `args`, `ports`, `env`
+
+**Pod overrides:** `containers`, `initContainers`
+
+These implicit restrictions exist separately from the configurable restricted fields
+described below.
+
+## Restricting override fields
+
+The DevWorkspace Operator allows cluster administrators to restrict which fields
+can be set via `pod-overrides` and `container-overrides` attributes.
+
+The restrict list supports two formats:
+
+- `"fieldName"` -- restricts the field entirely, regardless of value
+- `"fieldName=value"` -- restricts only a specific value for the field
+
+For nested fields such as securityContext or volumes, use dot notation: `securityContext.privileged=true`.
+
+On Kubernetes, the operator ships with default restricted fields that align
+with the Pod Security Standards baseline profile.
+On OpenShift, no fields are restricted by default since Security Context Constraints (SCC)
+already enforce security policies at the admission level.
+
+**Important:** Configuring `restrictedContainerOverrideFields` or `restrictedPodOverrideFields`
+**replaces** the platform defaults entirely. Admins who want to extend the default
+restrict list must re-include the default entries alongside any additional restrictions.
+
+**Limitation for plain boolean fields in pod overrides:**
+Some `PodSpec` fields such as `hostNetwork`, `hostPID`, and `hostIPC` are plain `bool`
+types in the Kubernetes API (not `*bool` pointers). Because Go zero-initializes
+unset `bool` fields to `false`, the operator cannot distinguish between a field that
+was explicitly set to `false` and one that was simply omitted. As a result, using the
+bare field name format (e.g. `"hostNetwork"`) to restrict these fields entirely will reject
+**all** pod overrides, including those that never mention the field. To avoid this,
+use the value-specific format instead (e.g. `"hostNetwork=true"`). The default restricted
+fields already follow this pattern. This limitation does not affect `*bool` pointer
+fields (e.g. `automountServiceAccountToken`, `shareProcessNamespace`, `hostUsers`)
+or non-boolean fields.
+
+For example, on Kubernetes, to add `volumeMounts` and `lifecycle` restrictions
+while keeping the default restricted container fields:
+
+```yaml
+apiVersion: controller.devfile.io/v1alpha1
+kind: DevWorkspaceOperatorConfig
+metadata:
+  name: devworkspace-operator-config
+config:
+  workspace:
+    overrides:
+      restrictedContainerOverrideFields:
+        # Default Kubernetes restricted fields (must be re-listed to retain them)
+        - "securityContext.privileged=true"
+        - "securityContext.runAsNonRoot=false"
+        - "securityContext.runAsUser=0"
+        - "securityContext.allowPrivilegeEscalation=true"
+        - "securityContext.procMount=Unmasked"
+        - "securityContext.capabilities.add"
+        # Additional restrictions
+        - "volumeMounts"
+        - "lifecycle"
+```
+
+Similarly, to extend the default restricted pod override fields on Kubernetes:
+
+```yaml
+apiVersion: controller.devfile.io/v1alpha1
+kind: DevWorkspaceOperatorConfig
+metadata:
+  name: devworkspace-operator-config
+config:
+  workspace:
+    overrides:
+      restrictedPodOverrideFields:
+        # Default Kubernetes restricted fields (must be re-listed to retain them)
+        - "hostNetwork=true"
+        - "hostPID=true"
+        - "hostIPC=true"
+        - "securityContext.runAsNonRoot=false"
+        - "securityContext.runAsUser=0"
+        - "volumes.hostPath"
+        # Additional restrictions
+        - "hostUsers=false"
+```

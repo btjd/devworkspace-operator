@@ -31,6 +31,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/utils/pointer"
 	crclient "sigs.k8s.io/controller-runtime/pkg/client"
+	gwapiv1 "sigs.k8s.io/gateway-api/apis/v1"
 )
 
 // diffFunc represents a function that compares a spec object against the corresponding cluster object and
@@ -41,7 +42,7 @@ var diffFuncs = map[reflect.Type]diffFunc{
 	reflect.TypeOf(rbacv1.Role{}):                  allDiffFuncs(metadataDiffFunc, basicDiffFunc(roleDiffOpts)),
 	reflect.TypeOf(rbacv1.RoleBinding{}):           allDiffFuncs(metadataDiffFunc, basicDiffFunc(rolebindingDiffOpts)),
 	reflect.TypeOf(corev1.ServiceAccount{}):        metadataDiffFunc,
-	reflect.TypeOf(appsv1.Deployment{}):            allDiffFuncs(deploymentDiffFunc, metadataDiffFunc, basicDiffFunc(deploymentDiffOpts)),
+	reflect.TypeOf(appsv1.Deployment{}):            allDiffFuncs(deploymentDiffFunc, metadataDiffFunc, podTemplateMetadataDiffFunc, basicDiffFunc(deploymentDiffOpts)),
 	reflect.TypeOf(corev1.Pod{}):                   allDiffFuncs(podDiffFunc, metadataDiffFunc),
 	reflect.TypeOf(corev1.ConfigMap{}):             allDiffFuncs(metadataDiffFunc, basicDiffFunc(configmapDiffOpts)),
 	reflect.TypeOf(corev1.Secret{}):                allDiffFuncs(metadataDiffFunc, basicDiffFunc(secretDiffOpts)),
@@ -49,7 +50,9 @@ var diffFuncs = map[reflect.Type]diffFunc{
 	reflect.TypeOf(batchv1.Job{}):                  allDiffFuncs(metadataDiffFunc, jobDiffFunc),
 	reflect.TypeOf(corev1.Service{}):               allDiffFuncs(metadataDiffFunc, serviceDiffFunc),
 	reflect.TypeOf(networkingv1.Ingress{}):         allDiffFuncs(metadataDiffFunc, basicDiffFunc(ingressDiffOpts)),
+	reflect.TypeOf(networkingv1.NetworkPolicy{}):   allDiffFuncs(metadataDiffFunc, basicDiffFunc(networkPolicyDiffOpts)),
 	reflect.TypeOf(routev1.Route{}):                allDiffFuncs(metadataDiffFunc, basicDiffFunc(routeDiffOpts)),
+	reflect.TypeOf(gwapiv1.HTTPRoute{}):            allDiffFuncs(metadataDiffFunc, basicDiffFunc(httpRouteDiffOpts)),
 }
 
 // basicDiffFunc returns a diffFunc that specifies an object needs an update if cmp.Equal fails
@@ -77,6 +80,36 @@ func metadataDiffFunc(spec, cluster crclient.Object) (delete, update bool) {
 	clusterRefs := cluster.GetOwnerReferences()
 	for _, ownerref := range spec.GetOwnerReferences() {
 		if !containsOwnerRef(ownerref, clusterRefs) {
+			return false, true
+		}
+	}
+	return false, false
+}
+
+// podTemplateMetadataDiffFunc requires a Deployment to be updated if any label or annotation present in the spec
+// deployment's pod template is missing from the cluster deployment's pod template or present with a different value.
+// Like metadataDiffFunc, it only checks the spec-to-cluster direction so that externally-added labels on the pod
+// template do not trigger an update. This is only safe because deploymentDiffOpts ignores PodTemplateSpec.ObjectMeta
+// — see diffopts.go.
+func podTemplateMetadataDiffFunc(spec, cluster crclient.Object) (delete, update bool) {
+	specDeploy, ok := spec.(*appsv1.Deployment)
+	if !ok {
+		return false, false
+	}
+	clusterDeploy, ok := cluster.(*appsv1.Deployment)
+	if !ok {
+		return false, false
+	}
+
+	clusterLabels := clusterDeploy.Spec.Template.Labels
+	for k, v := range specDeploy.Spec.Template.Labels {
+		if cv, ok := clusterLabels[k]; !ok || cv != v {
+			return false, true
+		}
+	}
+	clusterAnnotations := clusterDeploy.Spec.Template.Annotations
+	for k, v := range specDeploy.Spec.Template.Annotations {
+		if cv, ok := clusterAnnotations[k]; !ok || cv != v {
 			return false, true
 		}
 	}
